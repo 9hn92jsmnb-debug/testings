@@ -1,0 +1,582 @@
+
+local M = {}
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+
+local SimplePath = require(ReplicatedStorage["SimplePath (modified)"])
+
+local REG = {} :: {[Model]: {
+	Path: any,
+	bodyGyro: BodyGyro?,
+	humanoid: Humanoid,
+	attackAnimation: Animation,
+	blockAnimation: Animation,
+	attackDamage: number,
+	attacking: boolean,
+	blocking: boolean,
+	blockcooldown: boolean,
+	BlockDelay: number,
+	BlockLast: number,
+	Block: BoolValue?,
+	Parry: any?,
+	sword: BasePart?,
+	_swordWeld: Weld?,
+	_lastGoal: Vector3?,
+	_ragdolled: boolean?,
+	hbDeathConn: RBXScriptConnection?,
+	ancestryConn: RBXScriptConnection?,
+}}
+
+local HB: RBXScriptConnection? = nil
+local UPDATE_INTERVAL = 0.12
+local accumulator = 0
+local RANDOM = Random.new()
+
+local function safeHasHumanoid(model: Instance?): model
+	return model ~= nil
+		and model:IsA("Model")
+		and model.PrimaryPart ~= nil
+		and model:FindFirstChildOfClass("Humanoid") ~= nil
+end
+
+local function findSpawnLocationInModels(): Vector3
+	for _, obj in ipairs(workspace:GetDescendants()) do
+		if obj:IsA("Model") then
+			local spawnLocation = obj:FindFirstChild("SpawnLocation")
+			if spawnLocation and spawnLocation:IsA("BasePart") then
+				return spawnLocation.Position
+			end
+		end
+	end
+	return Vector3.new()
+end
+
+local GOAL = findSpawnLocationInModels()
+
+local function GetNearestCharacter(fromPosition: Vector3, players: {Player}): Model?
+	local nearest: Model? = nil
+	local dist = math.huge
+
+	for _, player in ipairs(players) do
+		local character = player.Character
+		if character and character.PrimaryPart then
+			local h = character:FindFirstChildOfClass("Humanoid")
+			if h and h.Health > 0 then
+				local npcAttr = character:GetAttribute("NPC")
+				if not npcAttr then
+					local d = (character.PrimaryPart.Position - fromPosition).Magnitude
+					if d < dist then
+						nearest, dist = character, d
+					end
+				end
+			end
+		end
+	end
+	return nearest
+end
+
+local function isWalking(h: Humanoid?)
+	return h ~= nil and h.MoveDirection.Magnitude > 0.05
+end
+
+local function isFacing(sourceHRP: BasePart?, targetHRP: BasePart?, maxAngleDeg: number?)
+	if not sourceHRP or not targetHRP then return false end
+	maxAngleDeg = maxAngleDeg or 45
+	local toTarget = (targetHRP.Position - sourceHRP.Position).Unit
+	local facing = sourceHRP.CFrame.LookVector
+	return facing:Dot(toTarget) >= math.cos(math.rad(maxAngleDeg))
+end
+
+local function runPath(rec, goal: Vector3)
+	if not rec or not goal then return end
+	if rec._lastGoal and (rec._lastGoal - goal).Magnitude < 0.25 then return end
+	rec._lastGoal = goal
+	rec.Path:Run(goal)
+end
+
+local function cleanupRecord(npc: Model)
+	local rec = REG[npc]
+	if not rec then return end
+
+	if rec.hbDeathConn then rec.hbDeathConn:Disconnect() end
+	if rec.ancestryConn then rec.ancestryConn:Disconnect() end
+	if rec.sword then rec.sword:Destroy() end
+	if rec.bodyGyro then rec.bodyGyro:Destroy() end
+	if rec.Path then rec.Path:Stop() end
+
+	REG[npc] = nil
+	if not next(REG) and HB then HB:Disconnect(); HB = nil end
+end
+
+local function doRagdollFrom(npc: Model)
+	local Dummy = npc
+	if not Dummy or not Dummy.Parent then return end
+
+	local zombiecorpse = Dummy:Clone()
+	Dummy:Destroy()
+	zombiecorpse.Parent = workspace
+	for _, d in ipairs(zombiecorpse:GetDescendants()) do
+		if d:IsA("Script") or d:IsA("LocalScript") then d:Destroy() end
+	end
+	--game.Debris:AddItem(zombiecorpse, 15)
+	local Humanoid = zombiecorpse:FindFirstChildOfClass("Humanoid")
+	local Torso = zombiecorpse:FindFirstChild("Torso")
+	if not Humanoid or not Torso then return end
+	Humanoid.PlatformStand = true
+	Humanoid:SetStateEnabled(Enum.HumanoidStateType.Dead, false)
+	for _,v in pairs(Torso:GetChildren()) do
+		if v.ClassName == 'Motor6D' or v.ClassName == 'Weld' then v:Destroy() end
+	end
+	for _,v in pairs(zombiecorpse:GetChildren()) do
+		if v.ClassName == "Part" then
+			for _,w in pairs(v:GetChildren()) do
+				if w.ClassName == "BodyPosition" or w.ClassName == "BodyVelocity" then w:Destroy() end
+			end
+		end
+	end
+	local function makeconnections(limb, a0, a1, tl, tu)
+		local c = Instance.new('BallSocketConstraint', limb)
+		c.LimitsEnabled = true
+		c.Attachment0 = a0
+		c.Attachment1 = a1
+		c.TwistLimitsEnabled = true
+		c.TwistLowerAngle = tl
+		c.TwistUpperAngle = tu
+		c.UpperAngle = 70
+	end
+	local function makehingeconnections(limb, a0, a1, low, up)
+		local c = Instance.new('HingeConstraint', limb)
+		c.Attachment0 = a0
+		c.Attachment1 = a1
+		c.LimitsEnabled = true
+		c.LowerAngle = low
+		c.UpperAngle = up
+	end
+	Humanoid.Parent['Right Arm'].RightShoulderAttachment.Position = Vector3.new(0, 0.5, 0)
+	Torso.RightCollarAttachment.Position = Vector3.new(1.5, 0.5, 0)
+	Humanoid.Parent['Left Arm'].LeftShoulderAttachment.Position = Vector3.new(0, 0.5, 0)
+	Torso.LeftCollarAttachment.Position = Vector3.new(-1.5, 0.5, 0)
+	local RightLegAttachment = Instance.new("Attachment", Humanoid.Parent["Right Leg"]); RightLegAttachment.Position = Vector3.new(0, 1, 0)
+	local TorsoRightLegAttachment = Instance.new("Attachment", Torso); TorsoRightLegAttachment.Position = Vector3.new(0.5, -1, 0)
+	local LeftLegAttachment = Instance.new("Attachment", Humanoid.Parent["Left Leg"]); LeftLegAttachment.Position = Vector3.new(0, 1, 0)
+	local TorsoLeftLegAttachment = Instance.new("Attachment", Torso); TorsoLeftLegAttachment.Position = Vector3.new(-0.5, -1, 0)
+	if Humanoid.Parent:FindFirstChild("Head") then
+		local HeadAttachment = Instance.new("Attachment", Humanoid.Parent.Head)
+		HeadAttachment.Position = Vector3.new(0, -0.5, 0)
+		makehingeconnections(Humanoid.Parent.Head, HeadAttachment, Torso.NeckAttachment, -20, 20)
+	end
+	makeconnections(Humanoid.Parent['Right Arm'], Humanoid.Parent['Right Arm'].RightShoulderAttachment, Torso.RightCollarAttachment, -80, 80)
+	makeconnections(Humanoid.Parent['Left Arm'], Humanoid.Parent['Left Arm'].LeftShoulderAttachment, Torso.LeftCollarAttachment, -80, 80)
+	makeconnections(Humanoid.Parent['Right Leg'], RightLegAttachment, TorsoRightLegAttachment, -80, 80)
+	makeconnections(Humanoid.Parent['Left Leg'], LeftLegAttachment, TorsoLeftLegAttachment, -80, 80)
+	local function addLimbCollider(limbName)
+		local limb = Humanoid.Parent:FindFirstChild(limbName)
+		if not limb then return end
+		local limbcollider = Instance.new("Part", limb)
+		limbcollider.Size = Vector3.new(1,1.3,1)
+		limbcollider.Shape = Enum.PartType.Cylinder
+		limbcollider.Transparency = 1
+		local limbcolliderweld = Instance.new("Weld", limbcollider)
+		limbcolliderweld.Part0 = limb
+		limbcolliderweld.Part1 = limbcollider
+		limbcolliderweld.C0 = CFrame.fromEulerAnglesXYZ(0,0,math.pi/2) * CFrame.new(-0.4,0,0)
+		for _,v in pairs(limb:GetChildren()) do
+			if v.ClassName == 'Motor6D' or v.ClassName == 'Weld' then v:Destroy() end
+		end
+	end
+	addLimbCollider("Right Arm")
+	addLimbCollider("Left Arm")
+	addLimbCollider("Left Leg")
+	addLimbCollider("Right Leg")
+	if zombiecorpse:FindFirstChild("HumanoidRootPart") then
+		zombiecorpse.HumanoidRootPart.CanCollide = false
+		zombiecorpse.HumanoidRootPart:Destroy()
+	end
+end
+
+local function stepAll(dt)
+	accumulator += dt
+	if accumulator < UPDATE_INTERVAL then return end
+	accumulator = 0
+	local players = Players:GetPlayers()
+	if #players == 0 then
+		for _, rec in pairs(REG) do
+			runPath(rec, GOAL)
+		end
+		return
+	end
+	for npc, rec in pairs(REG) do
+		local Dummy = npc
+		local humanoid = rec.humanoid
+		local primary = Dummy and Dummy.PrimaryPart
+		if (not Dummy.Parent) or (not humanoid) or humanoid.Health <= 0 or not primary then
+			if rec._ragdolled ~= true then
+				rec._ragdolled = true
+				doRagdollFrom(Dummy)
+			end
+			cleanupRecord(Dummy)
+		else
+			local npcPos = primary.Position
+			local nearestCharacter = GetNearestCharacter(npcPos, players)
+			local targetPos = nearestCharacter and nearestCharacter.PrimaryPart and nearestCharacter.PrimaryPart.Position or nil
+			if not rec.attacking and not rec.blocking then
+				if targetPos then
+					local dist = (npcPos - targetPos).Magnitude
+					local function DoBlock()
+						rec.Path:Stop()
+						rec.blocking = true
+						local blockTrack = humanoid:LoadAnimation(rec.blockAnimation)
+						blockTrack:Play()
+						task.wait(rec.BlockDelay)
+						if rec.Block then rec.Block.Value = true end
+						task.delay(rec.BlockLast, function()
+							rec.blocking = false
+							if rec.Block then rec.Block.Value = false end
+						end)
+					end
+					if dist < 40 and RANDOM:NextNumber() < 0.01 then
+						rec.attacking = true
+						local target = nearestCharacter
+						task.spawn(function()
+							if not target or not target.PrimaryPart then rec.attacking = false return end
+							local function distToTarget()
+								if not target or not target.PrimaryPart or not Dummy or not Dummy.PrimaryPart then
+									return math.huge
+								end
+								return (Dummy.PrimaryPart.Position - target.PrimaryPart.Position).Magnitude
+							end
+							local params = RaycastParams.new()
+							params.FilterType = Enum.RaycastFilterType.Exclude
+							params.FilterDescendantsInstances = { Dummy }
+							local function hasLOS(fromPos, toPos)
+								local dir = toPos - fromPos
+								local result = workspace:Raycast(fromPos + Vector3.new(0, 3, 0), dir, params)
+								return (not result) or result.Instance:IsDescendantOf(target)
+							end
+							local startT = time()
+							local attemptEnds = startT + 6
+							local commitEarliest = startT + 1.1
+							local hardCommit = startT + 5.25
+							local committed = false
+							local side = (RANDOM:NextNumber() < 0.5) and -1 or 1
+							local strategy = RANDOM:NextInteger(1, 6)
+							local nextStrategy = startT + 0.9 + RANDOM:NextNumber() * 0.5
+							local feintTimer = startT + 0.45
+							local feintMode = 0
+							local baitBack = false
+							while humanoid.Health > 0 and target and target.PrimaryPart and time() < attemptEnds do
+								local npcPos2 = Dummy.PrimaryPart.Position
+								local tgtPos = target.PrimaryPart.Position
+								local flatDir = (Vector3.new(tgtPos.X, npcPos2.Y, tgtPos.Z) - npcPos2)
+								if flatDir.Magnitude < 1e-3 then break end
+								local forward = flatDir.Unit
+								local right = Vector3.new(-forward.Z, 0, forward.X)
+								local t = time()
+								if t >= nextStrategy then
+									strategy = RANDOM:NextInteger(1,6)
+									side = (RANDOM:NextNumber() < 0.5) and -side or side
+									nextStrategy = t + 0.9 + RANDOM:NextNumber() * 0.6
+								end
+								if t >= feintTimer then
+									local opts = {-1,0,1}
+									feintMode = opts[RANDOM:NextInteger(1,3)]
+									feintTimer = t + 0.35 + RANDOM:NextNumber() * 0.35
+								end
+								local phase = math.clamp((t - startT) / (commitEarliest - startT), 0, 1)
+								local keepDist = (12 + 4 * math.noise(t * 0.7)) * (1 - phase) + 6 * phase
+								local strafeAmp = 8 * (1 - phase) + 3 * phase
+								local jitter = Vector3.new(math.noise(t * 3.1, 1) * 1.2, 0, math.noise(t * 3.1, 2) * 1.2)
+								local desired = tgtPos
+								local n1 = math.noise(t * 0.9)
+								local n2 = math.noise(t * 1.6)
+								local burst = (n2 > 0.35) and 6 or 0
+								if strategy == 1 then
+									local angleBias = side * (1.0 + 0.7 * math.abs(n1))
+									local flank = right * angleBias * (keepDist * 1.05)
+									local orbit = tgtPos - forward * (keepDist * 0.55)
+									local strafe = right * (math.noise(t * 1.6) * (strafeAmp * 1.8))
+									desired = orbit + flank + strafe + (forward * burst) + jitter
+								elseif strategy == 2 then
+									local theta = (side < 0 and -1 or 1) * math.rad(95)
+									local dir = (forward * math.cos(theta) + right * math.sin(theta)).Unit
+									desired = tgtPos - dir * (keepDist * 0.75) + right * side * 6 + forward * 4 + jitter
+								elseif strategy == 3 then
+									local s = math.sign(math.sin(t * 9.5))
+									local zig = right * s * (10 + 6 * math.noise(t * 2.7))
+									desired = tgtPos - forward * (keepDist - 6) + zig + forward * (3 * math.noise(t * 0.8)) + jitter
+								elseif strategy == 4 then
+									if not baitBack and distToTarget() < 12 then baitBack = true end
+									if baitBack then
+										desired = npcPos2 - forward * 10 + right * side * 7 + jitter
+									else
+										desired = tgtPos - forward * (keepDist * 0.8) + right * side * 7 + jitter
+									end
+								elseif strategy == 5 then
+									local v = target.PrimaryPart.AssemblyLinearVelocity
+									local v2 = Vector3.new(v.X, 0, v.Z)
+									local lead = v2 * 0.45
+									local lateral = v2:Dot(right)
+									desired = tgtPos + lead + right * (math.sign(lateral) * 5) - forward * (keepDist - 1) + right * side * 6 + jitter
+								else
+									desired = tgtPos - forward * (keepDist * 0.6) + right * side * 7 + forward * 4 + jitter
+								end
+								if feintMode == 1 then
+									desired = desired - forward * 9 + right * side * 6
+								elseif feintMode == -1 then
+									desired = desired + forward * 8 - right * side * 5
+								end
+								local targetVel = target.PrimaryPart.AssemblyLinearVelocity
+								local targetSpeed = Vector3.new(targetVel.X, 0, targetVel.Z).Magnitude
+								if t >= commitEarliest and hasLOS(npcPos2, tgtPos) and (distToTarget() <= 9 or targetSpeed < 4 or strategy == 6) then
+									committed = true
+									break
+								end
+								if t >= hardCommit then
+									committed = true
+									break
+								end
+								desired = Vector3.new(desired.X, npcPos2.Y, desired.Z)
+								runPath(rec, desired)
+								task.wait(0.08)
+							end
+
+							if committed and target and target.PrimaryPart then
+								local commitEnds = time() + 1.35
+								local bias = (RANDOM:NextNumber() < 0.5) and -1 or 1
+								local burst = true
+								while humanoid.Health > 0 and target and target.PrimaryPart and time() < commitEnds and distToTarget() > 6.25 do
+									local npcPos3 = Dummy.PrimaryPart.Position
+									local tgtPos3 = target.PrimaryPart.Position
+									local forward = (Vector3.new(tgtPos3.X, npcPos3.Y, tgtPos3.Z) - npcPos3).Unit
+									local right = Vector3.new(-forward.Z, 0, forward.X)
+									local p = math.clamp((commitEnds - time()) / 1.35, 0, 1)
+									local stepSide = right * bias * (1.5 + 2.0 * p)
+									local commitPos = tgtPos3 - forward * 5.0 + stepSide
+									if burst then
+										burst = false
+										commitPos = tgtPos3 - forward * 4.0 + right * bias * 2.5
+									end
+									commitPos = Vector3.new(commitPos.X, npcPos3.Y, commitPos.Z)
+									runPath(rec, commitPos)
+									task.wait(0.055)
+								end
+							end
+
+							if humanoid.Health > 0 and target and target.PrimaryPart then
+								local sidestepBias = (RANDOM:NextNumber() < 0.5) and -1 or 1
+								local npcPos4 = Dummy.PrimaryPart.Position
+								local tgtPos4 = target.PrimaryPart.Position
+								local forward = (Vector3.new(tgtPos4.X, npcPos4.Y, tgtPos4.Z) - npcPos4).Unit
+								local right = Vector3.new(-forward.Z, 0, forward.X)
+								runPath(rec, npcPos4 + right * sidestepBias * 1.75)
+								task.wait(0.06 + RANDOM:NextNumber() * 0.08)
+								local track = humanoid:LoadAnimation(rec.attackAnimation)
+								track:Play()
+								task.wait(0.09 + RANDOM:NextNumber() * 0.18)
+								local inRange = ((Dummy.PrimaryPart.Position - target.PrimaryPart.Position).Magnitude) <= 10
+								if inRange then
+									local th = target:FindFirstChildOfClass("Humanoid")
+									local parry = target:FindFirstChild("Parry")
+									if parry and parry:IsA("BoolValue") and parry.Value == true then
+										if rec.Parry and rec.Parry.Play then rec.Parry:Play() end
+										local npcPos5 = Dummy.PrimaryPart.Position
+										local tgtPos5 = target.PrimaryPart.Position
+										local back = (Vector3.new(npcPos5.X, 0, npcPos5.Z) - Vector3.new(tgtPos5.X, 0, tgtPos5.Z)).Unit
+										runPath(rec, npcPos5 + back * 10)
+										task.wait(0.26)
+										local blockTool = target:FindFirstChild("Guest")
+										if blockTool and blockTool:IsA("Tool") then
+											local bindable = blockTool:FindFirstChildWhichIsA("BindableEvent")
+											if bindable then bindable:Fire() end
+										end
+									elseif th then
+										if ((Dummy.PrimaryPart.Position - target.PrimaryPart.Position).Magnitude) <= 9 then
+											task.wait(0.08 + RANDOM:NextNumber() * 0.1)
+											task.wait(0.06 + RANDOM:NextNumber() * 0.12)
+											if ((Dummy.PrimaryPart.Position - target.PrimaryPart.Position).Magnitude) <= 9 then
+												th:TakeDamage(rec.attackDamage * 0.8)
+											end
+										end
+										if RANDOM:NextNumber() < 0.5 then
+											local npcPos6 = Dummy.PrimaryPart.Position
+											local tgtPos6 = target.PrimaryPart.Position
+											local forward3 = (Vector3.new(tgtPos6.X, 0, tgtPos6.Z) - Vector3.new(npcPos6.X, 0, npcPos6.Z)).Unit
+											local right3 = Vector3.new(-forward3.Z, 0, forward3.X)
+											runPath(rec, npcPos6 + forward3 * 4.5 + right3 * ((RANDOM:NextNumber() < 0.5) and -1 or 1) * 3)
+											task.wait(0.1)
+										end
+									end
+								else
+									if RANDOM:NextNumber() < 0.50 then
+										DoBlock()
+									end
+								end
+								if track.IsPlaying then track:Stop() end
+							end
+							rec.attacking = false
+						end)
+					elseif dist < 15
+						and not (rec.attacking or rec.blocking or rec.blockcooldown)
+						and nearestCharacter
+						and isWalking(nearestCharacter:FindFirstChildOfClass("Humanoid"))
+						and isFacing(nearestCharacter:FindFirstChild("HumanoidRootPart"), humanoid.Parent:FindFirstChild("HumanoidRootPart"), 45) then
+						rec.blocking = true
+						rec.Path:Stop()
+						local blockTrack = humanoid:LoadAnimation(rec.blockAnimation)
+						blockTrack:Play()
+						task.wait(rec.BlockDelay)
+						if rec.Block then rec.Block.Value = true end
+						task.delay(rec.BlockLast, function()
+							rec.blocking = false
+							if rec.Block then rec.Block.Value = false end
+							rec.blockcooldown = true
+							task.delay(5, function() rec.blockcooldown = false end)
+						end)
+					else
+						local toTarget = targetPos and (targetPos - npcPos) or nil
+						if toTarget and toTarget.Magnitude >= 1e-3 then
+							local forward = toTarget.Unit
+							local right = Vector3.new(-forward.Z, 0, forward.X)
+							local t = time()
+							local dist2 = toTarget.Magnitude
+							local closing = math.clamp((20 - dist2) / 20, 0, 1)
+							local orbitRadius = 20 + 10 * math.noise(t * 0.7 + 10) + 18 * closing
+							local strafeAmp = 18 + 10 * closing
+							local lateral = math.clamp(math.noise(t * 1.2), -1, 1)
+							local sidePulse = (math.noise(t * 0.6, 2) >= 0) and 1 or -1
+							local fn = math.noise(t * 3.0)
+							local feint = (fn > 0.25) and 1 or ((fn < -0.25) and -1 or 0)
+							local feintAmp = 10 + 10 * closing
+							local offset = right * (lateral * strafeAmp * sidePulse) + forward * (feint * feintAmp - orbitRadius)
+							local swirl = right * (math.sin(t * 1.6) * 8) + forward * (math.cos(t * 1.6) * -4)
+							offset += swirl
+							offset += Vector3.new(
+								math.noise(t * 6.0, 1) * (4 + 2 * closing),
+								0,
+								math.noise(t * 6.0, 2) * (4 + 2 * closing)
+							)
+							local burstGate = math.noise(t * 3.2, 7)
+							local burst = (burstGate > 0.6) and 1 or 0
+							offset += forward * (burst * (10 + 10 * closing)) + right * (burst * sidePulse * 5)
+							local desiredPos = targetPos + offset
+							desiredPos = Vector3.new(desiredPos.X, npcPos.Y, desiredPos.Z)
+							local toDesired = desiredPos - npcPos
+							if toDesired.Magnitude > 1e-3 then
+								local overshoot = toDesired.Unit * math.clamp(6 + 8 * closing, 6, 14)
+								desiredPos += overshoot
+							end
+							if dist2 < 12 then
+								local escapeMag = 18 + 12 * math.abs(math.noise(t * 1.7))
+								local side2 = (math.noise(t * 1.3, 3) >= 0) and 1 or -1
+								local escape = (-forward * escapeMag) + right * side2 * (10 + 4 * closing)
+								desiredPos += escape
+							end
+							runPath(rec, desiredPos)
+						else
+							runPath(rec, GOAL)
+						end
+					end
+				else
+					runPath(rec, GOAL)
+				end
+			end
+			if nearestCharacter and nearestCharacter.PrimaryPart then
+				local npcPos5 = primary.Position
+				local targetPos5 = nearestCharacter.PrimaryPart.Position
+				targetPos5 = Vector3.new(targetPos5.X, npcPos5.Y, targetPos5.Z)
+				rec.bodyGyro.CFrame = CFrame.new(npcPos5, targetPos5)
+			end
+		end
+	end
+end
+
+function M.start(npc: Model)
+	if not safeHasHumanoid(npc) or REG[npc] then warn("this guy already controlled") return end
+	local Dummy = npc
+	local humanoid = Dummy:FindFirstChildOfClass("Humanoid")
+	local Block = Dummy:FindFirstChild("Blocking")
+	local Torso = Dummy:FindFirstChild("Torso")
+	if not Block or not Torso then return end
+	local Path = SimplePath.new(Dummy)
+	Path.Visualize = false
+	local bodyGyro = Instance.new("BodyGyro")
+	bodyGyro.MaxTorque = Vector3.new(1e6, 1e6, 1e6)
+	bodyGyro.P = 1e4
+	bodyGyro.CFrame = Dummy.PrimaryPart.CFrame
+	bodyGyro.Parent = Dummy.PrimaryPart
+	do
+		local animation = Instance.new("Animation")
+		animation.AnimationId = "rbxassetid://105656452784439"
+		local animator = humanoid:FindFirstChildOfClass("Animator") or Instance.new("Animator", humanoid)
+		local animationTrack = animator:LoadAnimation(animation)
+		animationTrack.Looped = false
+		animationTrack:Play()
+		animationTrack.Stopped:Wait()
+	end
+	local sword = ReplicatedStorage.Items.NPC.SoggySword:Clone()
+	sword.Parent = Dummy
+	local rightHand = Dummy:FindFirstChild("RightHand") or Dummy:FindFirstChild("Right Arm")
+	local weld = Instance.new("Weld")
+	weld.Part0 = rightHand
+	weld.Part1 = sword
+	weld.Parent = rightHand
+	weld.C0 = CFrame.new(0, -1, 0) * CFrame.Angles(math.rad(-90), 0, 0)
+	weld.C1 = CFrame.new(0, 0, 0) * CFrame.Angles(0, math.rad(90), math.rad(90))
+	sword.Anchored = false
+	local Stats = require(sword:WaitForChild("Stats"))
+	local keys = {}
+	for key in pairs(Stats) do keys[#keys+1] = key end
+	local chosenStats = Stats[keys[RANDOM:NextInteger(1, #keys)]]
+	local IdleAnimId   = chosenStats.Idle
+	local SlashAnimId  = chosenStats.SlashAnimation
+	local BlockAnimId  = chosenStats.BlockAnimation
+	local BlockDelay   = chosenStats.BlockDelay
+	local BlockLast    = chosenStats.BlockLast
+	local Parry        = Dummy:FindFirstChild("Parry")
+	local idleAnimation = Instance.new("Animation")
+	idleAnimation.AnimationId = "rbxassetid://" .. IdleAnimId
+	local idleTrack = humanoid:LoadAnimation(idleAnimation)
+	idleTrack.Looped = true
+	idleTrack:Play()
+	local attackAnimation = Instance.new("Animation")
+	attackAnimation.AnimationId = "rbxassetid://" .. SlashAnimId
+	local blockAnimation = Instance.new("Animation")
+	blockAnimation.AnimationId = "rbxassetid://" .. BlockAnimId
+	REG[Dummy] = {
+		humanoid = humanoid,
+		Path = Path,
+		bodyGyro = bodyGyro,
+		Block = Block,
+		Parry = Parry,
+		attackAnimation = attackAnimation,
+		blockAnimation = blockAnimation,
+		BlockDelay = BlockDelay,
+		BlockLast = BlockLast,
+		attackDamage = 38,
+		attacking = false,
+		blocking = false,
+		blockcooldown = false,
+		_swordWeld = weld,
+		sword = sword,
+	}
+	REG[Dummy].hbDeathConn = humanoid.Died:Connect(function()
+		if REG[Dummy] and REG[Dummy]._ragdolled ~= true then
+			REG[Dummy]._ragdolled = true
+			doRagdollFrom(Dummy)
+		end
+		cleanupRecord(Dummy)
+	end)
+	REG[Dummy].ancestryConn = Dummy.AncestryChanged:Connect(function(_, parent)
+		if not parent then
+			cleanupRecord(Dummy)
+		end
+	end)
+	if not HB then
+		HB = RunService.PostSimulation:Connect(stepAll)
+	end
+
+end
+
+return M
