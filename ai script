@@ -4,38 +4,90 @@ local PhysicsService = game:GetService("PhysicsService")
 local ChatService = game:GetService("Chat")
 
 local COORD_ROLE_DURATION = 2.25
-local VOICE_COOLDOWN = 2.4
-local SPOT_COOLDOWN = 4
+local VOICE_COOLDOWN = 6
+local SPOT_COOLDOWN = 10
 
 local VOICE_LIBRARY: { [string]: { string } } = {
 	OrderSuppress = {
 		"Suppress that target!",
 		"Pin them down!",
+		"Keep their heads down!",
+		"Lay down cover fire!",
+		"Hold them in place!",
+		"Suppressing fire, go!",
+		"Light them up!",
 	},
 	OrderFlank = {
 		"Flank them now!",
 		"Move to their side!",
+		"Swing wide!",
+		"Hit their left!",
+		"Hit their right!",
+		"Get around them!",
+		"Wrap around, move!",
 	},
 	OrderAssault = {
 		"Push up!",
 		"Advance and hit them hard!",
+		"Move, move!",
+		"Press the attack!",
+		"Charge in!",
+		"Take that ground!",
+		"Close the distance!",
 	},
 	Confirm = {
 		"On it!",
 		"Copy!",
+		"Roger!",
+		"Affirmative!",
+		"Moving!",
+		"Got it!",
+		"Understood!",
 	},
 	Spot = {
 		"Contact spotted!",
 		"Eyes on target!",
+		"Enemy sighted!",
+		"Target in view!",
+		"Contact front!",
+		"Hostile! Hostile!",
+		"Got movement!",
 	},
 	Reload = {
 		"Reloading!",
 		"Cover me, reloading!",
+		"Changing mag!",
+		"Need a sec, reloading!",
+		"Reloading—cover!",
+		"Mag's dry!",
+		"Last mag, make it count!",
+	},
+	ManDown = {
+		"Man down!",
+		"He's hit!",
+		"We lost one!",
+		"Medic! Now!",
+		"He's going down!",
+		"He's bleeding out!",
+		"Someone get him up!",
+	},
+	Flanked = {
+		"They're behind us!",
+		"Flanked, behind!",
+		"Contact rear!",
+		"Rear! Rear!",
+		"Behind us, move!",
+		"Watch our six!",
+		"They got our back side!",
 	},
 	LastMan = {
 		"I'm the last one!",
 		"Only me left!",
 		"I'm alone here!",
+		"Last man standing!",
+		"No backup—I'm it!",
+		"I'm solo here!",
+		"It's just me now!",
 	},
 }
 export type AnimationTracks = {
@@ -50,6 +102,7 @@ export type NPCConfig = {
 	SpreadDegrees: number?,
 	BulletSpeed: number?,
 	AutoAimDistance: number?,
+	TargetSwitchCooldown: number?,
 	MinBurst: number?,
 	MaxBurst: number?,
 	RepositionDistance: number?,
@@ -75,7 +128,6 @@ export type NPCConfig = {
 	SuppressRange: number?,
 	SuppressCooldown: number?,
 	ReloadThreshold: number?,
-	ReloadDuration: number?,
 	AccuracyRecovery: number?,
 	BurstInaccuracyGrowth: number?,
 	BulletSize: Vector3?,
@@ -90,6 +142,7 @@ export type NPCConfig = {
 	SearchRadius: number?,
 	SearchAngularSpeed: number?,
 	Damage: number?,
+	Attack: boolean?,
 }
 
 export type NPCState = {
@@ -152,6 +205,9 @@ export type NPCState = {
 	Role: string,
 	RoleTimer: number,
 	SquadId: number?,
+	TargetSwitchTimer: number,
+	DamagedTimer: number,
+	LastHealth: number,
 	DiedConn: RBXScriptConnection?
 }
 
@@ -223,10 +279,6 @@ function resolveAnimations(animConfig: any?, defaults: AnimationTracks): Animati
 	}
 
 	local source = unwrapConfig(animConfig)
-	local originalSource = source
-	if typeof(source) == "table" and (source :: any).Animations ~= nil then
-		source = unwrapConfig((source :: any).Animations)
-	end
 
 	local function applyAnimations(from: any?)
 		if typeof(from) ~= "table" then
@@ -238,20 +290,21 @@ function resolveAnimations(animConfig: any?, defaults: AnimationTracks): Animati
 		resolved.Reload = normalizeAnimation((from :: any).Reload) or normalizeAnimation((from :: any).ReloadAnimation) or resolved.Reload
 	end
 
-	applyAnimations(source)
-	if originalSource ~= source then
-		applyAnimations(originalSource)
+	if typeof(source) == "table" then
+		if (source :: any).Animations ~= nil then
+			applyAnimations(unwrapConfig((source :: any).Animations))
+		end
+		applyAnimations(source)
 	end
 
 	return resolved
 end
 
 function playVoiceLine(state: NPCState, key: string)
-	if state.VoiceCooldown > 0 then
+	if state.VoiceCooldown > 0 and not (key == "ManDown") then
+		warn("voicecooldown")
 		return
 	end
-
-	
 
 	local options = VOICE_LIBRARY[key]
 	if not options or #options == 0 then
@@ -260,6 +313,7 @@ function playVoiceLine(state: NPCState, key: string)
 
 	local root = state.Root
 	if not root or not ChatService then
+		warn("no root")
 		return
 	end
 
@@ -333,6 +387,7 @@ local DEFAULTS: NPCConfig = {
 	SpreadDegrees = 4,
 	BulletSpeed = 320,
 	AutoAimDistance = 180,
+	TargetSwitchCooldown = 0.8,
 	MinBurst = 3,
 	MaxBurst = 10,
 	RepositionDistance = 24,
@@ -357,7 +412,6 @@ local DEFAULTS: NPCConfig = {
 	SuppressRange = 110,
 	SuppressCooldown = 6,
 	ReloadThreshold = 12,
-	ReloadDuration = 1.2,
 	AccuracyRecovery = 4.3,
 	BurstInaccuracyGrowth = 1.3,
 	BulletSize = Vector3.new(0.2, 0.2, 1.2),
@@ -372,6 +426,7 @@ local DEFAULTS: NPCConfig = {
 	SearchRadius = 10,
 	SearchAngularSpeed = 1.6,
 	Damage = 15,
+	Attack = false,
 }
 
 local activeNPCs: { NPCState } = {}
@@ -512,9 +567,42 @@ function refreshEnemyCandidates()
 		end
 	end
 end
+function callOutSquadDeath(state: NPCState)
+	if not state.Root or not state.SquadId then
+		return
+	end
+	
+
+	local squad = squads[state.SquadId]
+	if not squad then
+		return
+	end
+
+	local deathPos = state.Root.Position
+	local closestMember: NPCState? 
+	local closestDistance = math.huge
+	for _, member in ipairs(squad.members) do
+	
+		if member ~= state and isAlive(member) and member.Root then
+			local distance = (member.Root.Position - deathPos).Magnitude
+			if distance <= 50 then
+				if distance < closestDistance then
+					closestDistance = distance
+					closestMember = member
+					
+				end
+			end
+		end
+	end
+	if closestMember then
+		
+		playVoiceLine(closestMember, "ManDown")
+	end
+end
 function bindDeath(state: NPCState)
 	if state.Humanoid and not state.DiedConn then
 		state.DiedConn = state.Humanoid.Died:Connect(function()
+			callOutSquadDeath(state)
 			doRagdollFrom(state.Model)
 			m.RemoveNPC(state.Model)
 		end)
@@ -531,13 +619,25 @@ function blendConfigs(config: NPCConfig?): NPCConfig
 		end
 	end
 
+	local nestedConfig = (cfgTable :: any).NPCConfig
+	if typeof(nestedConfig) == "table" then
+		local keyMap: { [string]: string } = {}
+		for key in pairs(DEFAULTS) do
+			keyMap[string.lower(key)] = key
+		end
+		for key, value in pairs(nestedConfig) do
+			local mappedKey = keyMap[string.lower(tostring(key))] or key
+			cfgTable[mappedKey] = value
+		end
+	end
+
 	local result: NPCConfig = {}
 	for key, defaultValue in pairs(DEFAULTS) do
 		local value = (cfgTable :: any)[key]
 		result[key] = value ~= nil and value or defaultValue
 	end
 
-	result.Animations = resolveAnimations((cfgTable :: any).Animations, DEFAULT_ANIMATIONS)
+	result.Animations = resolveAnimations(cfgTable, DEFAULT_ANIMATIONS)
 	return result
 end
 
@@ -551,8 +651,8 @@ function doRagdollFrom(npc: Model)
 	local Dummy = npc
 	if not Dummy or not Dummy.Parent then return end
 
-	local zombiecorpse = Dummy:Clone()
-	Dummy:Destroy()
+	local zombiecorpse = Dummy
+
 	zombiecorpse.Parent = workspace
 	for _, d in ipairs(zombiecorpse:GetDescendants()) do
 		if d:IsA("Script") or d:IsA("LocalScript") then d:Destroy() end
@@ -827,7 +927,7 @@ end
 function chooseBestDirection(origin, baseDir, params, probe)
 	local candidates = {}
 
-	function addCandidate(dir, weight)
+	local function addCandidate(dir, weight)
 		local hit = workspace:Raycast(origin, dir * probe, params)
 		local distance = hit and hit.Distance or probe
 		local normal = hit and hit.Normal or Vector3.zero
@@ -949,6 +1049,7 @@ function pruneUnusedCommanders(groups: { [Model]: { [number]: { NPCState } } })
 end
 
 function issueOrder(commander: NPCState, recipient: NPCState, role: string)
+	if commander.VoiceCooldown > 0 then return end
 	local normalized = role
 	if role == "Suppress" then
 		normalized = "Suppressor"
@@ -959,7 +1060,7 @@ function issueOrder(commander: NPCState, recipient: NPCState, role: string)
 	recipient.Role = normalized
 	recipient.RoleTimer = COORD_ROLE_DURATION
 	recipient.ActiveOrderFrom = commander.Model
-
+	
 	if commander ~= recipient then
 		local orderKey = "Order" .. role
 		playVoiceLine(commander, orderKey)
@@ -968,6 +1069,7 @@ function issueOrder(commander: NPCState, recipient: NPCState, role: string)
 		playVoiceLine(commander, "Order" .. role)
 	end
 end
+
 
 function shouldRefreshOrders(group: { NPCState }): boolean
 	for _, state in ipairs(group) do
@@ -1359,6 +1461,10 @@ function shouldTakeCover(state: NPCState, distance: number): boolean
 		return false
 	end
 
+	if state.DamagedTimer > 0 then
+		return true
+	end
+
 	local needsReloadCover = state.ReloadTimer > 0 or state.Mag < state.Config.ReloadThreshold
 	if needsReloadCover then
 		return true
@@ -1413,31 +1519,37 @@ function pickTarget(state: NPCState)
 
 	local best: Model? = nil
 	local bestScore = -math.huge
+	local currentTarget = state.Target
+	local currentValid = false
 
-	if targetIsAlive(state.Target) then
-		local cached = enemyCandidateMap[state.Target]
-		local hrp = cached and cached.Root or state.Target:FindFirstChild("HumanoidRootPart")
+	if targetIsAlive(currentTarget) then
+		local cached = enemyCandidateMap[currentTarget]
+		local hrp = cached and cached.Root or currentTarget:FindFirstChild("HumanoidRootPart")
 		if hrp then
 			local dist = (hrp.Position - root.Position).Magnitude
 			local withinRange = dist <= state.Config.AutoAimDistance * 1.1
 			if withinRange then
 				local hasLOS = hasLineOfSight(origin, hrp, state.Model)
-				best = state.Target
+				best = currentTarget
 				bestScore = scoreTarget(hrp, hasLOS)
+				currentValid = true
 			end
 		end
 	end
 
-	for _, candidate in ipairs(enemyCandidates) do
-		if candidate.Model ~= state.Model then
-			local hrp = candidate.Root
-			local dist = (hrp.Position - root.Position).Magnitude
-			if dist < state.Config.AutoAimDistance then
-				local hasLOS = hasLineOfSight(origin, hrp, state.Model)
-				local candidateScore = scoreTarget(hrp, hasLOS)
-				if candidateScore > bestScore then
-					best = candidate.Model
-					bestScore = candidateScore
+	local lockout = state.TargetSwitchTimer > 0 and currentValid
+	if not lockout then
+		for _, candidate in ipairs(enemyCandidates) do
+			if candidate.Model ~= state.Model then
+				local hrp = candidate.Root
+				local dist = (hrp.Position - root.Position).Magnitude
+				if dist < state.Config.AutoAimDistance then
+					local hasLOS = hasLineOfSight(origin, hrp, state.Model)
+					local candidateScore = scoreTarget(hrp, hasLOS)
+					if candidateScore > bestScore then
+						best = candidate.Model
+						bestScore = candidateScore
+					end
 				end
 			end
 		end
@@ -1446,6 +1558,11 @@ function pickTarget(state: NPCState)
 	if best ~= state.Target then
 		local previousTarget = state.Target
 		state.Target = best
+		if best then
+			state.TargetSwitchTimer = state.Config.TargetSwitchCooldown
+		else
+			state.TargetSwitchTimer = 0
+		end
 		if not best then
 			state.LastSeenPosition = nil
 			state.LastSeenVelocity = nil
@@ -1650,8 +1767,6 @@ function updateMovement(state: NPCState, dt: number)
 		return
 	end
 
-	local prevTag = state.StateTag
-
 	if not state.Target or not state.Target.Parent then
 		if state.LastSeenPosition then
 			if state.SearchVerifying then
@@ -1722,6 +1837,29 @@ function updateMovement(state: NPCState, dt: number)
 		return
 	end
 
+	if root then
+		local toTarget = (targetRoot.Position - root.Position)
+		if toTarget.Magnitude > 0.1 then
+			local dot = root.CFrame.LookVector:Dot(toTarget.Unit)
+			if dot < -0.35 then
+				playVoiceLine(state, "Flanked")
+			end
+		end
+	end
+
+	if state.Config.Attack then
+		local toTarget = targetRoot.Position - root.Position
+		setMovement(state, toTarget)
+		if state.ShootingTrackTimer > 0 then
+			playTrack(state, state.Config.Animations and state.Config.Animations.Shooting, true)
+		else
+			playTrack(state, state.Config.Animations and state.Config.Animations.Aiming, true)
+		end
+		state.StateTag = "Assaulting"
+		driveFacing(state, targetRoot.Position)
+		return
+	end
+
 	state.StrafeTimer -= dt
 	state.JukeTimer = math.max(0, state.JukeTimer - dt)
 
@@ -1764,7 +1902,6 @@ function updateMovement(state: NPCState, dt: number)
 			setMovement(state, peekDir)
 		end
 
-		if prevTag ~= "TakingCover" then print("taking cover") end
 		state.StateTag = "TakingCover"
 		playTrack(state, state.Config.Animations and state.Config.Animations.Aiming, true)
 		driveFacing(state, state.LastSeenPosition or targetRoot.Position)
@@ -1819,7 +1956,6 @@ function updateMovement(state: NPCState, dt: number)
 			setMovement(state, Vector3.zero)
 		end
 
-		if prevTag ~= "TakingCover" then print("taking cover") end
 		state.StateTag = "TakingCover"
 		if needsReloadCover then
 			playTrack(state, state.Config.Animations and state.Config.Animations.Reload, false)
@@ -1959,7 +2095,7 @@ function reloadIfNeeded(state: NPCState)
 
 	if mustReload then
 		local reloadAnim = state.Config.Animations and state.Config.Animations.Reload
-		local duration = state.Config.ReloadDuration
+		local duration = 1.2
 		if state.Animator and reloadAnim then
 			stopTrack(state)
 			local track = state.Animator:LoadAnimation(reloadAnim)
@@ -1968,7 +2104,7 @@ function reloadIfNeeded(state: NPCState)
 			track:Play(0.1, 1, 1)
 			state.CurrentTrack = track
 			if track.Length and track.Length > 0 then
-				duration = math.max(duration, track.Length)
+				duration = track.Length
 			end
 		else
 			playTrack(state, reloadAnim, false)
@@ -2011,6 +2147,8 @@ function updateShooting(state: NPCState, dt: number)
 		return
 	end
 
+	driveFacing(state, targetRoot.Position)
+
 	if state.BurstRemaining <= 0 then
 		state.BurstRemaining = math.random(state.Config.MinBurst, state.Config.MaxBurst)
 		state.PeekTimer = state.Config.PeekDuration
@@ -2036,9 +2174,17 @@ function updateShooting(state: NPCState, dt: number)
 
 	local aimOffset = computeAimOffset(state)
 	local predicted = predictTargetPosition(targetRoot, state.LastSeenVelocity, state.Config.BulletSpeed, origin.Position)
-	local desired = (predicted + aimOffset - origin.Position).Unit
+	local desired = predicted + aimOffset - origin.Position
+	if desired.Magnitude < 0.001 then
+		return
+	end
 
-	local spreadDir = makeSpreadDirection(desired, state.Config.SpreadDegrees, state.AccuracyBloom)
+	local aimLerp = state.Config.AimLerp or 0.2
+	local smoothing = clamp01(dt * (6 + aimLerp * 10))
+	state.AimVelocity = lerp(state.AimVelocity, desired, smoothing)
+	local aimDir = state.AimVelocity.Magnitude > 0.001 and state.AimVelocity.Unit or desired.Unit
+
+	local spreadDir = makeSpreadDirection(aimDir, state.Config.SpreadDegrees, state.AccuracyBloom)
 	spawnBullet(muzzle, spreadDir, state.Config.BulletSpeed, state.Config, state)
 
 	state.ShootingTrackTimer = math.max(state.ShootingTrackTimer, 0.35)
@@ -2098,6 +2244,7 @@ function ensureConnection()
 				state.VoiceCooldown = math.max(0, state.VoiceCooldown - dt)
 				state.SpotCooldownTimer = math.max(0, state.SpotCooldownTimer - dt)
 				state.RoleTimer = math.max(0, state.RoleTimer - dt)
+				state.TargetSwitchTimer = math.max(0, state.TargetSwitchTimer - dt)
 
 				state.ReactionTimer = math.max(0, state.ReactionTimer - dt)
 				state.PeekTimer = math.max(0, state.PeekTimer - dt)
@@ -2113,6 +2260,14 @@ function ensureConnection()
 				state.CoverTimer = math.max(0, state.CoverTimer - dt)
 				state.CoverCooldownTimer = math.max(0, state.CoverCooldownTimer - dt)
 				state.ShootingTrackTimer = math.max(0, state.ShootingTrackTimer - dt)
+				state.DamagedTimer = math.max(0, state.DamagedTimer - dt)
+				if state.Humanoid then
+					local currentHealth = state.Humanoid.Health
+					if currentHealth < state.LastHealth then
+						state.DamagedTimer = 0.6
+					end
+					state.LastHealth = currentHealth
+				end
 				if state.ReloadTimer <= 0 and state.ReloadSeekingCover and state.Mag >= state.Config.ReloadThreshold then
 					state.ReloadSeekingCover = false
 					state.ReloadCoverWait = 0
@@ -2235,6 +2390,9 @@ function m.start(model: Model, configOverride: any?)
 		Role = "Assault",
 		RoleTimer = 0,
 		SquadId = nil,
+		TargetSwitchTimer = 0,
+		DamagedTimer = 0,
+		LastHealth = humanoid and humanoid.Health or 0,
 	}
 	bindDeath(state)
 
