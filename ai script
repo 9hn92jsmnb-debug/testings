@@ -1,1148 +1,649 @@
---animations are Free models
---  AI is 80% made by me
-wait (2)
-
-local TweenService = game:GetService("TweenService")
-local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
-local Util = require(game:GetService("ReplicatedStorage").Modules.Util.npc_util)
-local PathfindingService = game:GetService("PathfindingService")
-local npc = script.Parent
-local torso = npc.Torso
-local head = npc.Head
-local leftarm = npc["Left Arm"]
-local rightarm = npc["Right Arm"]
-local leftleg = npc["Left Leg"]
-local rightleg = npc["Right Leg"]
-local npchumanoid = npc.Humanoid
-local npcFlash = npc:FindFirstChild("Flashed")
-local currentAnimTrack = nil  
---local aksound = npc["AK-47"].shoot
---Motor6D's
-local neck = torso.Neck
---neck.C1 = CFrame.new(0,0,0)
-local leftshoulder = torso["Left Shoulder"]
---leftshoulder.C1 = CFrame.new(0,0,0)
-local rightshoulder = torso["Right Shoulder"]
---rightshoulder.C1 = CFrame.new(0,0,0)
-local lefthip = torso["Left Hip"]
---lefthip.C1 = CFrame.new(0,0,0)
-local righthip = torso["Right Hip"]
---righthip.C1 = CFrame.new(0,0,0)
-local root = npc.HumanoidRootPart.RootJoint
---root.C1 = CFrame.new(0,0,0)
+local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Debris = game:GetService("Debris")
+
+local Util = require(ReplicatedStorage.Modules.Util.npc_util)
 local SimplePath = require(ReplicatedStorage.Modules.SimplePath)
-local Path = SimplePath.new(npc)
-local function findSpawnLocationInModels()
-	for _, obj in ipairs(game.Workspace:GetDescendants()) do
-		if obj:IsA("Model") then
-			local spawnLocation = obj:FindFirstChild("SpawnLocation")
-			if spawnLocation then
-				return spawnLocation
+
+local Controller = {}
+
+type CombatConfig = {
+	SightRange: number,
+	ShootRange: number,
+	FireInterval: number,
+	BulletSpeed: number,
+	BulletLife: number,
+	BulletDamageMin: number,
+	BulletDamageMax: number,
+	MagazineSize: number,
+	ReloadDuration: number,
+	BulletDrop: Vector3,
+}
+
+type MovementConfig = {
+	WalkSpeed: number,
+	KickRange: number,
+	PathUpdateInterval: number,
+}
+
+type PerceptionConfig = {
+	TargetRefreshInterval: number,
+	GrenadeCheckRadius: number,
+}
+
+type AnimationConfig = {
+	Idle: string,
+	Walk: string,
+	Shoot: {string},
+	Reload: string,
+}
+
+type AudioConfig = {
+	ShootSoundName: string,
+}
+
+type DebugConfig = {
+	VisualizePath: boolean,
+}
+
+type RotationConfig = {
+	Enabled: boolean,
+	P: number,
+	D: number,
+	MaxTorque: Vector3,
+}
+
+type NPCConfig = {
+	Combat: CombatConfig,
+	Movement: MovementConfig,
+	Perception: PerceptionConfig,
+	Animations: AnimationConfig,
+	Audio: AudioConfig,
+	Debug: DebugConfig,
+	Rotation: RotationConfig,
+}
+
+local DEFAULT_CONFIG: NPCConfig = {
+	Combat = {
+		SightRange = 180,
+		ShootRange = 170,
+		FireInterval = 0.2,
+		BulletSpeed = 350,
+		BulletLife = 5,
+		BulletDamageMin = 1,
+		BulletDamageMax = 5,
+		MagazineSize = 30,
+		ReloadDuration = 1.5,
+		BulletDrop = Vector3.new(0, -15, 0),
+	},
+	Movement = {
+		WalkSpeed = 16,
+		KickRange = 5,
+		PathUpdateInterval = 0.25,
+	},
+	Perception = {
+		TargetRefreshInterval = 0.3,
+		GrenadeCheckRadius = 25,
+	},
+	Animations = {
+		Idle = "rbxassetid://98564293923592",
+		Walk = "rbxassetid://98564293923592",
+		Shoot = {
+			"rbxassetid://126320314278150",
+			"rbxassetid://109848498488419",
+		},
+		Reload = "rbxassetid://107885163606729",
+	},
+	Audio = {
+		ShootSoundName = "shoot",
+	},
+	Debug = {
+		VisualizePath = false,
+	},
+	Rotation = {
+		Enabled = true,
+		P = 3000,
+		D = 400,
+		MaxTorque = Vector3.new(0, 500000, 0),
+	},
+}
+
+local CONFIG = {} :: {[Model]: {
+	Combat: {
+		SightRange: number,
+		ShootRange: number,
+		FireInterval: number,
+		BulletSpeed: number,
+		BulletLife: number,
+		BulletDamageMin: number,
+		BulletDamageMax: number,
+		MagazineSize: number,
+		ReloadDuration: number,
+		BulletDrop: Vector3,
+	},
+	Movement: {
+		WalkSpeed: number,
+		KickRange: number,
+		PathUpdateInterval: number,
+	},
+	Perception: {
+		TargetRefreshInterval: number,
+		GrenadeCheckRadius: number,
+	},
+	Animations: {
+		Idle: string,
+		Walk: string,
+		Shoot: {string},
+		Reload: string,
+	},
+	Audio: {
+		ShootSoundName: string,
+	},
+	Debug: {
+		VisualizePath: boolean,
+	},
+	Rotation: {
+		Enabled: boolean,
+		P: number,
+		D: number,
+		MaxTorque: Vector3,
+	},
+}}
+
+type NPCContext = {
+	npc: Model,
+	humanoid: Humanoid,
+	root: BasePart,
+	head: BasePart,
+	animator: Animator,
+	animationCache: {[string]: AnimationTrack},
+	currentTrack: AnimationTrack?,
+	state: string,
+	ammo: number,
+	reloading: boolean,
+	lastShotTime: number,
+	target: Model?,
+	path: any,
+	flashTag: BoolValue?,
+	pathAccumulator: number,
+	targetAccumulator: number,
+	bodyGyro: BodyGyro?,
+}
+
+local REG = {} :: {[Model]: {
+	npc: Model,
+	humanoid: Humanoid,
+	root: BasePart,
+	head: BasePart,
+	animator: Animator,
+	animationCache: {[string]: AnimationTrack},
+	currentTrack: AnimationTrack?,
+	state: string,
+	ammo: number,
+	reloading: boolean,
+	lastShotTime: number,
+	target: Model?,
+	path: any,
+	flashTag: BoolValue?,
+	pathAccumulator: number,
+	targetAccumulator: number,
+	bodyGyro: BodyGyro?,
+}}
+
+local HEARTBEAT_CONNECTION: RBXScriptConnection? = nil
+
+local function cloneConfig(): NPCConfig
+	return {
+		Combat = {
+			SightRange = DEFAULT_CONFIG.Combat.SightRange,
+			ShootRange = DEFAULT_CONFIG.Combat.ShootRange,
+			FireInterval = DEFAULT_CONFIG.Combat.FireInterval,
+			BulletSpeed = DEFAULT_CONFIG.Combat.BulletSpeed,
+			BulletLife = DEFAULT_CONFIG.Combat.BulletLife,
+			BulletDamageMin = DEFAULT_CONFIG.Combat.BulletDamageMin,
+			BulletDamageMax = DEFAULT_CONFIG.Combat.BulletDamageMax,
+			MagazineSize = DEFAULT_CONFIG.Combat.MagazineSize,
+			ReloadDuration = DEFAULT_CONFIG.Combat.ReloadDuration,
+			BulletDrop = DEFAULT_CONFIG.Combat.BulletDrop,
+		},
+		Movement = {
+			WalkSpeed = DEFAULT_CONFIG.Movement.WalkSpeed,
+			KickRange = DEFAULT_CONFIG.Movement.KickRange,
+			PathUpdateInterval = DEFAULT_CONFIG.Movement.PathUpdateInterval,
+		},
+		Perception = {
+			TargetRefreshInterval = DEFAULT_CONFIG.Perception.TargetRefreshInterval,
+			GrenadeCheckRadius = DEFAULT_CONFIG.Perception.GrenadeCheckRadius,
+		},
+		Animations = {
+			Idle = DEFAULT_CONFIG.Animations.Idle,
+			Walk = DEFAULT_CONFIG.Animations.Walk,
+			Shoot = {table.unpack(DEFAULT_CONFIG.Animations.Shoot)},
+			Reload = DEFAULT_CONFIG.Animations.Reload,
+		},
+		Audio = {
+			ShootSoundName = DEFAULT_CONFIG.Audio.ShootSoundName,
+		},
+		Debug = {
+			VisualizePath = DEFAULT_CONFIG.Debug.VisualizePath,
+		},
+		Rotation = {
+			Enabled = DEFAULT_CONFIG.Rotation.Enabled,
+			P = DEFAULT_CONFIG.Rotation.P,
+			D = DEFAULT_CONFIG.Rotation.D,
+			MaxTorque = DEFAULT_CONFIG.Rotation.MaxTorque,
+		},
+	}
+end
+
+local function resolveConfigFromModel(npc: Model): NPCConfig
+	local existing = CONFIG[npc]
+	if existing then
+		return existing
+	end
+	local cfg = cloneConfig()
+	local configModule = npc:FindFirstChild("Config")
+	if configModule and configModule:IsA("ModuleScript") then
+		local ok, loaded = pcall(require, configModule)
+		if ok and type(loaded) == "table" then
+			local combat = loaded.Combat
+			if type(combat) == "table" then
+				if combat.SightRange ~= nil then cfg.Combat.SightRange = combat.SightRange end
+				if combat.ShootRange ~= nil then cfg.Combat.ShootRange = combat.ShootRange end
+				if combat.FireInterval ~= nil then cfg.Combat.FireInterval = combat.FireInterval end
+				if combat.BulletSpeed ~= nil then cfg.Combat.BulletSpeed = combat.BulletSpeed end
+				if combat.BulletLife ~= nil then cfg.Combat.BulletLife = combat.BulletLife end
+				if combat.BulletDamageMin ~= nil then cfg.Combat.BulletDamageMin = combat.BulletDamageMin end
+				if combat.BulletDamageMax ~= nil then cfg.Combat.BulletDamageMax = combat.BulletDamageMax end
+				if combat.MagazineSize ~= nil then cfg.Combat.MagazineSize = combat.MagazineSize end
+				if combat.ReloadDuration ~= nil then cfg.Combat.ReloadDuration = combat.ReloadDuration end
+				if combat.BulletDrop ~= nil then cfg.Combat.BulletDrop = combat.BulletDrop end
+			end
+			local movement = loaded.Movement
+			if type(movement) == "table" then
+				if movement.WalkSpeed ~= nil then cfg.Movement.WalkSpeed = movement.WalkSpeed end
+				if movement.KickRange ~= nil then cfg.Movement.KickRange = movement.KickRange end
+				if movement.PathUpdateInterval ~= nil then cfg.Movement.PathUpdateInterval = movement.PathUpdateInterval end
+			end
+			local perception = loaded.Perception
+			if type(perception) == "table" then
+				if perception.TargetRefreshInterval ~= nil then cfg.Perception.TargetRefreshInterval = perception.TargetRefreshInterval end
+				if perception.GrenadeCheckRadius ~= nil then cfg.Perception.GrenadeCheckRadius = perception.GrenadeCheckRadius end
+			end
+			local animations = loaded.Animations
+			if type(animations) == "table" then
+				if animations.Idle ~= nil then cfg.Animations.Idle = animations.Idle end
+				if animations.Walk ~= nil then cfg.Animations.Walk = animations.Walk end
+				if type(animations.Shoot) == "table" and #animations.Shoot > 0 then cfg.Animations.Shoot = animations.Shoot end
+				if animations.Reload ~= nil then cfg.Animations.Reload = animations.Reload end
+			end
+			local audio = loaded.Audio
+			if type(audio) == "table" then
+				if audio.ShootSoundName ~= nil then cfg.Audio.ShootSoundName = audio.ShootSoundName end
+			end
+			local debugCfg = loaded.Debug
+			if type(debugCfg) == "table" then
+				if debugCfg.VisualizePath ~= nil then cfg.Debug.VisualizePath = debugCfg.VisualizePath end
+			end
+			local rotation = loaded.Rotation
+			if type(rotation) == "table" then
+				if rotation.Enabled ~= nil then cfg.Rotation.Enabled = rotation.Enabled end
+				if rotation.P ~= nil then cfg.Rotation.P = rotation.P end
+				if rotation.D ~= nil then cfg.Rotation.D = rotation.D end
+				if rotation.MaxTorque ~= nil then cfg.Rotation.MaxTorque = rotation.MaxTorque end
 			end
 		end
 	end
-	return nil
+	CONFIG[npc] = cfg
+	return cfg
 end
-local goal = findSpawnLocationInModels()
---
 
-local Bullet = 0
-local Reloading = false
+--[[
+local CONFIG_TEMPLATE = {
+	Combat = {
+		SightRange = 180,
+		ShootRange = 170,
+		FireInterval = 0.2,
+		BulletSpeed = 350,
+		BulletLife = 5,
+		BulletDamageMin = 1,
+		BulletDamageMax = 5,
+		MagazineSize = 30,
+		ReloadDuration = 1.5,
+		BulletDrop = Vector3.new(0, -15, 0),
+	},
+	Movement = {
+		WalkSpeed = 16,
+		KickRange = 5,
+		PathUpdateInterval = 0.25,
+	},
+	Perception = {
+		TargetRefreshInterval = 0.3,
+		GrenadeCheckRadius = 25,
+	},
+	Animations = {
+		Idle = "rbxassetid://98564293923592",
+		Walk = "rbxassetid://98564293923592",
+		Shoot = {
+			"rbxassetid://126320314278150",
+			"rbxassetid://109848498488419",
+		},
+		Reload = "rbxassetid://107885163606729",
+	},
+	Audio = {
+		ShootSoundName = "shoot",
+	},
+	Debug = {
+		VisualizePath = false,
+	},
+	Rotation = {
+		Enabled = true,
+		P = 3000,
+		D = 400,
+		MaxTorque = Vector3.new(0, 500000, 0),
+	},
+}
 
-local LastSeen = false
-local sight = math.random(135, 250)
-local following = false
-local walking = false
-local shooting = false
-local kicking = false
-local canshoot = true
-local cansay = true
-local Running = false
-Path.Visualize = false 
-local saycooldown = 0
-local animationId = "rbxassetid://98189797657551"
-local detectionRadius = 7 
-local animator = npchumanoid and npchumanoid:FindFirstChildOfClass("Animator") or Instance.new("Animator", npchumanoid)
-local animation = Instance.new("Animation")
-animation.AnimationId = animationId
-local animationTrack = animator:LoadAnimation(animation)
---[[local akweld = Instance.new("Weld", npc["Pistol"])
-akweld.Part0 = rightarm
-akweld.Part1 = npc["Pistol"]]
-function walkanim(walkspeed)
-	if walkspeed > 5 then
-		walking = true
-	else
-		walking = false
+return CONFIG_TEMPLATE
+]]
+
+Controller.Config = CONFIG
+Controller.DefaultConfig = DEFAULT_CONFIG
+
+local function getAnimator(humanoid: Humanoid): Animator
+	local animator = humanoid:FindFirstChildOfClass("Animator")
+	if animator then
+		return animator
 	end
+	animator = Instance.new("Animator")
+	animator.Parent = humanoid
+	return animator
 end
-npchumanoid.Running:connect(walkanim)
-local pathfindingService = game:GetService("PathfindingService")
-local function canSeeTarget(npc, targetCharacter)
-	local head = npc.Head
+
+local function canSeeTarget(npc: Model, fromPart: BasePart, targetCharacter: Model): boolean
 	local targetRoot = targetCharacter:FindFirstChild("HumanoidRootPart") or targetCharacter:FindFirstChild("Head")
-	if not head or not targetRoot then
+	if not targetRoot or not targetRoot:IsA("BasePart") then
 		return false
 	end
-	local direction = (targetRoot.Position - head.Position).unit
-	local distance = (targetRoot.Position - head.Position).magnitude
+	local direction = targetRoot.Position - fromPart.Position
+	local distance = direction.Magnitude
+	if distance <= 0 then
+		return true
+	end
 	local raycastParams = RaycastParams.new()
-	raycastParams.FilterDescendantsInstances = {npc} 
+	raycastParams.FilterDescendantsInstances = {npc}
 	raycastParams.FilterType = Enum.RaycastFilterType.Blacklist
-	local result = workspace:Raycast(head.Position, direction * distance, raycastParams)
-	if result then
-		--print("Blocked by:", result.Instance.Name)  
-		return result.Instance:IsDescendantOf(targetCharacter)  
+	local result = workspace:Raycast(fromPart.Position, direction.Unit * distance, raycastParams)
+	if not result then
+		return true
 	end
-	return true  
+	return result.Instance:IsDescendantOf(targetCharacter)
 end
 
-local function findNearestCover()
-	local origin = torso.Position
-	local maxDistance = 100
-	local nearestTarget = nil
-	local shortestDistance = maxDistance
-
-	for _, model in ipairs(workspace:GetDescendants()) do
-		if model:IsA("Model") and model:FindFirstChild("Humanoid") and model:FindFirstChild("HumanoidRootPart") then
-			local mercenaryTag = model:FindFirstChild("Corporation")
-			if not (mercenaryTag and mercenaryTag:IsA("BoolValue") and mercenaryTag.Value == true) then
-				local distance = (origin - model.HumanoidRootPart.Position).Magnitude
-				if distance < shortestDistance then
-					shortestDistance = distance
-					nearestTarget = model
-				end
-			end
-		end
-	end
-
-	local minCoverDistanceFromTarget = 10
-	if not nearestTarget then return nil end
-
-	local targetPart = nearestTarget:FindFirstChild("Head") or nearestTarget:FindFirstChild("HumanoidRootPart")
-	if not targetPart then return nil end
-
-	local bestCover = nil
-	local bestCoverDistance = maxDistance
-	local bestCoverPosition = nil
-
-	for _, part in ipairs(workspace:GetDescendants()) do
-		if part:IsA("BasePart") and part.CanCollide and part.Transparency < 1 and part ~= torso and part ~= targetPart then
-			local model = part:FindFirstAncestorWhichIsA("Model")
-			if model and model:FindFirstChildOfClass("Humanoid") and model:FindFirstChild(part.Name) == part then
-				continue
-			end
-			if part.Size.X < torso.Size.X or part.Size.Y < torso.Size.Y then
-				continue
-			end
-			if (part.Position - targetPart.Position).Magnitude < minCoverDistanceFromTarget then
-				continue
-			end
-			if part.Position.Y < torso.Position.Y - 10 then
-				continue
-			end
-			if part.Position.Y > torso.Position.Y + 20 then
-				continue
-			end
-
-			local toCover = (part.Position - targetPart.Position).Unit
-			local fromCoverToNPC = (origin - part.Position).Unit
-
-			local rayParams = RaycastParams.new()
-			rayParams.FilterDescendantsInstances = {npc, nearestTarget}
-			rayParams.FilterType = Enum.RaycastFilterType.Blacklist
-			rayParams.IgnoreWater = true
-
-			local rayToCover = workspace:Raycast(targetPart.Position, toCover * maxDistance, rayParams)
-			local rayToNPC = workspace:Raycast(part.Position, fromCoverToNPC * maxDistance, rayParams)
-
-			if rayToCover and rayToCover.Instance == part and (not rayToNPC or rayToNPC.Instance ~= targetPart) then
-				local distance = (origin - part.Position).Magnitude
-				if distance < bestCoverDistance then
-					bestCoverDistance = distance
-					bestCover = part
-					print(bestCover.Name)
-					local coverNormal = (part.Position - targetPart.Position).Unit
-					bestCoverPosition = part.Position + coverNormal * (part.Size.Magnitude / 2 + 1)
-				end
-			end
-		end
-	end
-
-	if bestCover and bestCoverPosition then
-		return bestCover, bestCoverPosition
-	end
-
-	return nil
-end
-
-local function GetNearestCharacter(fromPosition)
-	if npcFlash.Value then return end
-	local character, dist = nil, math.huge
+local function getNearestEnemy(context: NPCContext)
+	local nearestCharacter: Model? = nil
+	local nearestDistance = math.huge
+	local config = resolveConfigFromModel(context.npc)
 	for _, player in ipairs(Players:GetPlayers()) do
-		if player.Character and player.Character.PrimaryPart then
-			local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
-			local cloaked = player.Character:FindFirstChild("Cloaked")
-			local Ally = player.Character:FindFirstChild("Corporation")
-			if not Ally then
-				Ally = Instance.new("BoolValue")  
-				Ally.Name = "Corporation"               
-				
-					Ally.Value = false
-				          
-				Ally.Parent = player.Character               
-				print("Created Ally tag for:", player.Name)
-			end
-			if humanoid and humanoid.Health > 0 and not (cloaked and cloaked.Value) and not Ally.Value then 
-				local distance = (player.Character.PrimaryPart.Position - fromPosition).Magnitude
-				if distance < dist then
-					character, dist = player.Character, distance
-				end
-			end
+		local character = player.Character
+		if not character or character == context.npc then
+			continue
+		end
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		local root = character:FindFirstChild("HumanoidRootPart")
+		local cloaked = character:FindFirstChild("Cloaked")
+		local corp = character:FindFirstChild("Corporation")
+		if not humanoid or humanoid.Health <= 0 or not root then
+			continue
+		end
+		if cloaked and cloaked:IsA("BoolValue") and cloaked.Value then
+			continue
+		end
+		if corp and corp:IsA("BoolValue") and corp.Value then
+			continue
+		end
+		local dist = (root.Position - context.root.Position).Magnitude
+		if dist < nearestDistance and dist <= config.Combat.SightRange then
+			nearestDistance = dist
+			nearestCharacter = character
 		end
 	end
-	return character
+	return nearestCharacter, nearestDistance
 end
-local function getback()
-	local lowestHealth = math.huge
-	local selectedTorso, selectedPos
-	for _, model in ipairs(workspace:GetChildren()) do
-		if model ~= npc 
-			and model:IsA("Model") 
-			and model.Name ~= npc.Name 
-			and model.Name == "Corporation shielder"
-			and model:FindFirstChild("Corporation") then
 
-			local corpTag = model:FindFirstChild("Corporation")
-			if corpTag:IsA("BoolValue") and corpTag.Value then
-				local humanoid = model:FindFirstChildOfClass("Humanoid")
-				if humanoid and humanoid.Health > 0 then
-					local torso = model:FindFirstChild("Torso") or model:FindFirstChild("UpperTorso")
-					if torso and torso:IsA("BasePart") then
-						if (npc.PrimaryPart.Position - torso.Position).Magnitude <= 50 then
-							if humanoid.Health < lowestHealth then
-								lowestHealth = humanoid.Health
-								selectedTorso = torso
-								selectedPos = torso.Position + torso.CFrame.LookVector * -5
-							end
-						end
-					end
-				end
-			end
-		end
-	end
-	if selectedTorso and selectedPos then
-		return selectedPos, selectedTorso
-	end
-	return nil
-end
-function createTextLabel(npc, text, textSize, textColor, backgroundColor)
-	
-	if not head then
-		warn("NPC does not have a head:", npc.Name)
+local function setState(context: NPCContext, nextState: string, force: boolean?)
+	if context.state == nextState and not force then
 		return
 	end
-	local existingGui = npc:FindFirstChild("NPCTextLabel")
-	if existingGui then
-		existingGui:Destroy()
+	context.state = nextState
+	local config = resolveConfigFromModel(context.npc)
+	if context.currentTrack then
+		context.currentTrack:Stop(0.15)
+		context.currentTrack = nil
 	end
-	local billboardGui = Instance.new("BillboardGui")
-	billboardGui.Name = "NPCTextLabel"
-	billboardGui.Adornee = head
-	billboardGui.Size = UDim2.new(5, 0, 2, 0) 
-	billboardGui.StudsOffset = Vector3.new(0, 3, 0) 
-	billboardGui.AlwaysOnTop = true 
-	billboardGui.Parent = npc 
-	
-	local textLabel = Instance.new("TextLabel")
-	textLabel.Size = UDim2.new(1, 0, 1, 0)
-	textLabel.BackgroundColor3 = backgroundColor or Color3.fromRGB(0, 0, 0) 
-	textLabel.BackgroundTransparency = 0.5 
-	textLabel.Text = text or "NPC"
-	textLabel.TextColor3 = textColor or Color3.fromRGB(255, 255, 255)
-	textLabel.TextScaled = true 
-	textLabel.Font = Enum.Font.SourceSansBold 
-	textLabel.Parent = billboardGui
-	game.Debris:AddItem(billboardGui, 3)
-end
-function checkandshoot()
-	local presetTexts = {
-		-- Aggressive/Threatening Lines
-		"You're not getting away!",
-		"Take this!",
-		"Enemy spotted!",
-		"Say goodbye!",
-		"Time to die!",
-		"I'll finish you off!",
-		"You're doomed!",
-		"No escape for you!",
-		"I've got you now!",
-		"Prepare to be defeated!",
-		-- Tactical/Command Lines
-		"Target locked!",
-		"Engaging the enemy!",
-		"Focusing fire!",
-		"Suppressing the target!",
-		"Cover me, I'm going in!",
-		"They're in my sights!",
-		"Advancing on the enemy!",
-		"Flanking now!",
-		"Taking the shot!",
-		"Hold your ground!",
-		-- Injured/Desperate Lines
-		"You won't stop me!",
-		"I'm still standing!",
-		"You'll regret that!",
-		"Is that all you've got?",
-		"Not done yet!",
-		"I'll make you pay!",
-		"Retreating for now!",
-		"Backing off!",
-		"This isn't over!",
-		"You can't win!",
-		-- Generic NPC/Dialogue Lines
-		"Get them!",
-		"There they are!",
-		"Time to fight!",
-		"This ends now!",
-		"You can't hide forever!",
-		"I'll catch you!",
-		"You won't escape!",
-		"Stop running!",
-		"It's over for you!",
-		"Let's finish this!"
-	}
-	local presetText2 = {
-		"Cover my back!",
-		"Watch my rear!",
-		"Stay sharp!",
-		"Eyes behind me!",
-		"Watch your flanks!",
-		"Cover me, I'm moving!",
-		"Stick together!",
-		"Don't let them sneak up!",
-		"Hold formation!",
-		"Keep me covered!",
-		--"They're flanking us!",
-		--"Incoming from behind!",
-		"Don't let them get behind me!",
-		"Check our six!",
-		"Watch our blind spots!",
-		"Eyes on all sides!",
-		"Cover all angles!",
-		"Keep me covered!",
-		"I need backup on the rear!",
-		"I've got the front, cover the back!",
-		"I'll take point, you handle the rear!",
-		"Push forward, but watch behind!",
-		"Secure our six!",
-		"Don't let them flank us!",
-		"Focus on the front, I've got your back!",
-	}
-	local hitText = {
-		-- Aggressive/Threatening Lines
-		"Take that!",
-		"You can't dodge forever!",
-		"Got you now!",
-		"That had to hurt!",
-		"Direct hit!",
-		"Try blocking this!",
-		"You're going down!",
-		"Too slow!",
-		"That's gonna leave a mark!",
-		"You're finished!",
-		-- Tactical/Combat Callouts
-		"Target hit!",
-		"Enemy damaged!",
-		"Confirmed strike!",
-		"Press the attack!",
-		"They're wounded!",
-		"Another hit landed!",
-		"Weak spot found!",
-		"Keep up the pressure!",
-		"One more hit should do it!",
-		"They're on the ropes!",
-		-- Humorous/Fun Lines
-		"Oops, did that hurt?",
-		"Bet you felt that one!",
-		"Bullseye!",
-		"Right where it hurts!",
-		"Lucky shot? Nah, pure skill!",
-		"Try shaking that off!",
-		"Ding! You've been tagged!",
-		"Achievement unlocked: Get hit!",
-		"You're my favorite target!",
-		"I'm just getting started!"
-	}
-	local cloakresponses = {
-		"Am i fighting 106 or something? Where did he go?",
-		"Did you see that? Someone just disappeared!",
-		"Where did they go?",
-		"I could have sworn someone was here...",
-		"What the...? They vanished!",
-		"Stay alert! Someone's using a cloaking device!",
-		"I saw something... but now it's gone.",
-		"They're cloaked! Find them!",
-		"This isn't good. We've got a stealth operative.",
-		"I can't see them anymore!",
-		"Is that the Team Fortress 2 spy?!",
-		"They're using stealth tech! Be careful!",
-		"Where did they go? Check the area!",
-		"I don't like this... someone's hiding.",
-		"They just disappeared! What kind of tech is that?",
-		"Keep your eyes open! They're still here somewhere.",
-		"I saw a shimmer... they're cloaked!",
-		"They're gone! Fan out and search!",
-		"This is bad. They're invisible now.",
-		"They're using a cloaking device! Don't let them escape!",
-		"I can't track them anymore!",
-		"They're hiding... find them!"
-	}
-	local coverResponse = {
-		"Hiding already? Pathetic!",
-		"Cover won’t save you forever!",
-		"Run and hide, coward!",
-		"You think that cover makes you safe?",
-		"Keep hiding! It just delays the inevitable!",
-		"What’s wrong? Afraid to fight?",
-		"Come on out, I just want to talk… with bullets!",
-		"A little cover won’t stop me!",
-		"Stay there, I’ll come finish the job myself!",
-		"Oh, I love a good game of hide and seek!",
-		"I’m coming for you, cover won’t help!",
-		"You can’t stay there forever!",
-		"I’ll flush you out one way or another!",
-		"Cover’s nice… until I break through it!",
-		"Hiding? That just makes the hunt more fun!",
-		"I see you. You’re not getting away.",
-		"You’re just making this harder on yourself!",
-		"That cover won’t hold up for long!",
-		"Stay put, I’ll make sure you never move again!",
-		"You really think I won’t find a way around?",
-		"Cover is good… until you run out of options.",
-		"Nice cover. Too bad I have explosives!",
-		"If I were you, I’d pick better cover.",
-		"That won’t protect you from everything.",
-		"Hope you brought enough cover for all of us!",
-		"Funny how people hide right before they die.",
-		"Bad choice. I’ve got you pinned now.",
-		"That cover just bought you a few more seconds.",
-		"Stay there, I’ll just aim for the gaps!",
-		"Hope you’re comfortable, because you’re stuck!"
-	}
-	local flashed = {
-		"Im flashed!"
-	}
-	local kicktext = {
-		"Back off!",
-		"Stay out of my space!",
-		"Too close!",
-		"Get away from me!",
-		"You’re in my way!",
-		"Out of my face!",
-		"Move!",
-		"Too slow!",
-		"Not so close!",
-		"Stay back!",
-		"You think you can get that close?",
-		"Personal space, ever heard of it?",
-		"You’re not welcome here!",
-		"Keep your distance!",
-		"I don’t need you this close!",
-		"Step back!",
-		"You’re in striking range!",
-		"I saw that coming!",
-		"Kicking you out—literally!",
-		"Not today!"
-	}
-	while wait() do
-		saycooldown = saycooldown + 1
-		if saycooldown == 500 then
-			cansay = true
-			saycooldown = 0
-		end
-		for i,v in pairs(workspace:GetChildren()) do
-			if v.ClassName == "Model" and v.Name ~= "" and not string.find(v.Name:lower(), "corporation") then
-				local victimhumanoid = v:FindFirstChildOfClass("Humanoid")
-				local victimhead = v:FindFirstChild("Head")
-				local cloaktag = v:FindFirstChild("Cloaked") 
-				local allytag = v:FindFirstChild("Corporation")
-				if not allytag then
-					allytag = Instance.new("BoolValue")  
-					allytag.Name = "Corporation"               
-					
-						allytag.Value = false
-					          
-					allytag.Parent = v                 
-					print("Created Ally tag for:", v.Name)
-				end
-				if not cloaktag then
-					cloaktag = Instance.new("BoolValue", v)
-					cloaktag.Name = "Cloaked"
-					cloaktag.Value = false 
-					--print("Created Cloaked BoolValue in", v.Name)
-				end
-				local function visualizeRay(startPos, endPos, color)
-					local rayPart = Instance.new("Part")
-					rayPart.Size = Vector3.new(0.2, 0.2, (endPos - startPos).Magnitude)
-					rayPart.CFrame = CFrame.new(startPos, endPos) * CFrame.new(0, 0, -rayPart.Size.Z / 2)
-					rayPart.Anchored = true
-					rayPart.CanCollide = false
-					rayPart.Material = Enum.Material.Neon
-					rayPart.Color = color or Color3.fromRGB(255, 0, 0) 
-					rayPart.Parent = workspace
-					game:GetService("Debris"):AddItem(rayPart, 0.5) 
-				end
-				if victimhumanoid and victimhead and v.Name ~= npc.Name and not (cloaktag.value or npcFlash.Value or allytag.Value or following) then
-					if npcFlash.Value then return end
-					if (victimhead.Position - head.Position).magnitude < sight and canSeeTarget(npc,victimhumanoid.Parent)then
-						if victimhumanoid.Name == "Blackout" and cansay then
-
-						elseif not shooting and victimhumanoid.Health > 0 and canshoot then
-							shooting = true
-							walking = false
-							local randomText = presetTexts[math.random(1, #presetTexts)]
-							local randomText2 = presetText2[math.random(1, #presetText2)]
-							local randomText3 = cloakresponses[math.random(1, #cloakresponses)]
-							local randomText4 = coverResponse[math.random(1, #coverResponse)]
-							local randomText5 = flashed[math.random(1, #flashed)]
-							local randomText6 = kicktext[math.random(1, #kicktext)]
-							if kicking then
-								createTextLabel(npc, randomText6, 24, Color3.fromRGB(255, 255, 255), Color3.fromRGB(0, 0, 0))
-							else
-								createTextLabel(npc, randomText, 24, Color3.fromRGB(255, 255, 255), Color3.fromRGB(0, 0, 0))
-							end
-							local doesshoot = 0
-							local canfire = true
-							local suppressiveFire = false
-							local suppressiveFireTriggered = false
-							local hpnow = npchumanoid.Health
-							local walk = 0
-							npchumanoid.WalkSpeed = 16
-							while shooting and (victimhead.Position - head.Position).magnitude < sight and victimhumanoid.Health > 0 and canshoot do
-								--monitorFlash()
-								doesshoot = doesshoot + 1
-								walk = walk + 1
-								if npchumanoid.PlatformStand == false then
-									npc.HumanoidRootPart.CFrame = CFrame.new(npc.HumanoidRootPart.Position,Vector3.new(victimhead.Position.x,npc.HumanoidRootPart.Position.y,victimhead.Position.z))
-								end
-
-								if cloaktag.value then
-									shooting = false
-									walking = false
-									createTextLabel(npc, randomText3, 24, Color3.fromRGB(255, 255, 255), Color3.fromRGB(0, 0, 0))
-									--[[local dashForce = 1000
-									local randomDirection = Vector3.new(math.random(-100, 100), 0, math.random(-100, 100))
-								    randomDirection = randomDirection.Unit * dashForce
-									dashAI(npc,randomDirection)]]
-								end
-								if npcFlash.Value then 
-									shooting = false
-									walking = false
-									createTextLabel(npc, randomText5, 24, Color3.fromRGB(255, 255, 255), Color3.fromRGB(0, 0, 0))
-								end
-
-								if not canSeeTarget(npc, victimhumanoid.Parent) and not kicking then
-									walking = false
-									if math.random() < 1 then
-										print("suppresing")
-										shooting = true
-										task.delay(5, function()
-											shooting = false
-										end)
-									else
-										shooting = false
-									end
-									createTextLabel(npc, randomText4, 24, Color3.fromRGB(255, 255, 255), Color3.fromRGB(0, 0, 0))
-								end
-								if Bullet == 30 then
-									Reloading = true
-									if currentAnimTrack then
-										currentAnimTrack:Stop()
-										currentAnimTrack = nil
-										task.wait(0.1) 
-									end
-									local animator = npchumanoid:FindFirstChildOfClass("Animator") 
-									if not animator then
-										animator = Instance.new("Animator")
-										animator.Parent = npchumanoid
-									end
-									local reload = Instance.new("Animation")
-									reload.AnimationId = "rbxassetid://107885163606729"
-									currentAnimTrack = animator:LoadAnimation(reload)
-									print("Playing")
-
-									if currentAnimTrack then
-										currentAnimTrack.Priority = Enum.AnimationPriority.Action
-										currentAnimTrack.Looped = false
-										currentAnimTrack:Play()
-										currentAnimTrack:AdjustSpeed(1.2) 
-
-										currentAnimTrack.Stopped:Wait()
-
-										shooting = false
-										Reloading = false
-										Bullet = 0
-
-										print("Animation finished, continuing...")
-									else
-										warn("Failed to play rev animation.")
-									end
-								end
-								if canfire and not (kicking or Reloading) then
-
-									--[[if math.random() <= 0.2 then
-										suppressiveFire = true
-										shooting = true
-										walking = false
-										--print("suppress test")
-										
-										task.delay(5, function()
-											suppressiveFire = false
-										end)
-									end]]
-									npc["M16"].shoot:Play()
-									local bullet = Instance.new("Part", npc)
-									Bullet += 1
-
-									bullet.Size = Vector3.new(0.3,0.3,3.5)
-									bullet.Material = "Neon"
-									bullet.CFrame = npc["M16"].CFrame * CFrame.new(0,0,1)
-									bullet.CanCollide = false
-									bullet.CFrame = CFrame.new(bullet.Position, victimhead.Position)
-									Util.ApplyBallistics(bullet, 350, 55, Vector3.new(0, -15, 0), "X")
-									local pointlight = Instance.new("PointLight", npc["M16"])
-									game.Debris:AddItem(pointlight,0.1)
-									local function damage(part)
-
-										local damage = math.random(1, 5)
-										
-										local randomHitText = hitText[math.random(1, #hitText)]
-										--local damage = math.random(1)
-										if part.Parent.ClassName ~= "Accessory" 
-											and part.Parent.Parent.ClassName ~= "Accessory" 
-											and part.ClassName ~= "Accessory" 
-											and part.Parent.Name ~= npc.Name 
-											and part.CanCollide == true 
-										then
-											bullet:destroy()
-											local victimhumanoid = part.Parent:findFirstChildOfClass("Humanoid")
-											local Ally = part.Parent:FindFirstChild("Corporation")
-											if not Ally then
-												Ally = Instance.new("BoolValue")
-												Ally.Name = "Corporation"
-												Ally.Parent = part.Parent
-											end
-											if Ally.Value then  return end
-											if victimhumanoid then
-												if victimhumanoid.Health > damage then
-													victimhumanoid:TakeDamage(damage)
-													--createTextLabel(npc, randomHitText, 24, Color3.fromRGB(255, 255, 255), Color3.fromRGB(0, 0, 0))
-												else
-													victimhumanoid:TakeDamage(damage)
-													--createTextLabel(npc, randomHitText, 24, Color3.fromRGB(255, 255, 255), Color3.fromRGB(0, 0, 0))
-												end
-											end
-										end
-									end
-									game.Debris:AddItem(bullet, 5)
-									bullet.Touched:connect(damage)
-									local touchedConnection
-									touchedConnection = bullet.Touched:Connect(function(hit)
-										damage(hit)
-
-										if touchedConnection then
-											touchedConnection:Disconnect()
-										end
-									end)
-								end
-								wait(0.2)
-							end
-							walking = false
-							shooting = false
-						end
-					end
-				end
+	local animId: string? = nil
+	if nextState == "Idle" then
+		animId = config.Animations.Idle
+	elseif nextState == "Walk" then
+		animId = config.Animations.Walk
+	elseif nextState == "Shoot" then
+		animId = config.Animations.Shoot[math.random(1, #config.Animations.Shoot)]
+	elseif nextState == "Reload" then
+		animId = config.Animations.Reload
+	end
+	if not animId then
+		return
+	end
+	local animTrack = context.animationCache[animId]
+	if not animTrack then
+		local animation = Instance.new("Animation")
+		animation.AnimationId = animId
+		animTrack = context.animator:LoadAnimation(animation)
+		context.animationCache[animId] = animTrack
+	end
+	animTrack.Priority = (nextState == "Shoot" or nextState == "Reload") and Enum.AnimationPriority.Action or Enum.AnimationPriority.Movement
+	animTrack.Looped = nextState ~= "Reload"
+	animTrack:Play(0.15)
+	context.currentTrack = animTrack
+	if nextState == "Reload" then
+		task.delay(animTrack.Length, function()
+			if REG[context.npc] ~= context then
+				return
 			end
-		end
+			context.ammo = 0
+			context.reloading = false
+			setState(context, "Idle")
+		end)
 	end
 end
 
-function run()
-
-	local lastHealth = npchumanoid.Health
-
-	npchumanoid.HealthChanged:Connect(function(newHealth)
-		if newHealth < lastHealth then
-			lastHealth = newHealth
-			local dorun = math.random(1, 1)
-			if dorun == 1 and not walking then
-				if following then return end
-				print("Damage detected, attempting to find cover...")
-				local cover, coverPos = findNearestCover()
-				if cover and coverPos then
-					print("yup cover")
-					Path:Stop()
-					Running = true
-					Path.Visualize = true
-					shooting = false
-					canshoot = false
-					walking = true
-					npchumanoid.WalkSpeed = 28
-
-					local reachedConn
-					reachedConn = Path.Reached:Connect(function()
-						reachedConn:Disconnect()
-						--Running = false
-						shooting = false
-						canshoot = true
-						walking = false
-						npchumanoid.WalkSpeed = 16
-						local coverSize = cover.Size
-						local coverPos = cover.Position
-						local peekOffsets = {
-							Vector3.new(coverSize.X / 2 + 2, 0, 0),   -- Right
-							Vector3.new(-coverSize.X / 2 - 2, 0, 0),  -- Left
-							Vector3.new(0, 0, coverSize.Z / 2 + 2),   -- Front
-							Vector3.new(0, 0, -coverSize.Z / 2 - 2),  -- Back
-						}
-
-						local rayParams = RaycastParams.new()
-						rayParams.FilterDescendantsInstances = {npc, cover}
-						rayParams.FilterType = Enum.RaycastFilterType.Blacklist
-
-						for _, offset in ipairs(peekOffsets) do
-							local peekPos = coverPos + offset
-							local direction = (peekPos - npc.PrimaryPart.Position).Unit * 10
-							local result = workspace:Raycast(npc.PrimaryPart.Position, direction, rayParams)
-
-							if not result then
-								print("peeking")
-								Path:Run(peekPos)
-							else if result then
-									Running = false
-								end
-								break
-							end
-						end
-					end)
-
-					Path:Run(coverPos)
-				end
+local function fireAtTarget(context: NPCContext, targetRoot: BasePart)
+	if context.reloading then
+		return
+	end
+	local config = resolveConfigFromModel(context.npc)
+	if context.ammo >= config.Combat.MagazineSize then
+		context.reloading = true
+		setState(context, "Reload")
+		return
+	end
+	if os.clock() - context.lastShotTime < config.Combat.FireInterval then
+		return
+	end
+	context.lastShotTime = os.clock()
+	context.ammo += 1
+	setState(context, "Shoot")
+	local weapon = context.npc:FindFirstChild("Gun").Value
+	if weapon and weapon:IsA("BasePart") then
+		local shootSound = weapon:FindFirstChild(config.Audio.ShootSoundName)
+		if shootSound and shootSound:IsA("Sound") then
+			shootSound:Play()
+		end
+		local bullet = Instance.new("Part")
+		bullet.Name = "NPCBullet"
+		bullet.Size = Vector3.new(0.3, 0.3, 3.5)
+		bullet.Material = Enum.Material.Neon
+		bullet.CanCollide = false
+		bullet.CFrame = CFrame.new(weapon.Position, targetRoot.Position)
+		bullet.Parent = context.npc
+		Util.ApplyBallistics(bullet, config.Combat.BulletSpeed, 55, config.Combat.BulletDrop, "X")
+		local hitConnection
+		hitConnection = bullet.Touched:Connect(function(hit)
+			if not hit or not hit.Parent then
+				return
 			end
-		else
-			lastHealth = newHealth
+			if hit:IsDescendantOf(context.npc) then
+				return
+			end
+			local victimHumanoid = hit.Parent:FindFirstChildOfClass("Humanoid")
+			if victimHumanoid then
+				victimHumanoid:TakeDamage(math.random(config.Combat.BulletDamageMin, config.Combat.BulletDamageMax))
+			end
+			if hitConnection then
+				hitConnection:Disconnect()
+			end
+			bullet:Destroy()
+		end)
+		Debris:AddItem(bullet, config.Combat.BulletLife)
+	end
+end
+
+local function updateBodyGyro(context: NPCContext, targetPosition: Vector3)
+	local bodyGyro = context.bodyGyro
+	if not bodyGyro then
+		return
+	end
+	local lookAt = Vector3.new(targetPosition.X, context.root.Position.Y, targetPosition.Z)
+	bodyGyro.CFrame = CFrame.new(context.root.Position, lookAt)
+end
+
+local function updateOneNPC(context: NPCContext, dt: number)
+	if not context.npc.Parent or context.humanoid.Health <= 0 then
+		REG[context.npc] = nil
+		CONFIG[context.npc] = nil
+		return
+	end
+	local config = resolveConfigFromModel(context.npc)
+	context.pathAccumulator += dt
+	context.targetAccumulator += dt
+	local flashed = context.flashTag and context.flashTag.Value
+	if flashed then
+		context.humanoid.WalkSpeed = 0
+		context.path:Stop()
+		setState(context, "Idle")
+		return
+	else
+		context.humanoid.WalkSpeed = config.Movement.WalkSpeed
+	end
+	if context.targetAccumulator >= config.Perception.TargetRefreshInterval then
+		context.targetAccumulator = 0
+		context.target = getNearestEnemy(context)
+	end
+	local targetCharacter = context.target
+	if not targetCharacter then
+		context.path:Stop()
+		setState(context, "Idle")
+		return
+	end
+	local targetRoot = targetCharacter:FindFirstChild("HumanoidRootPart")
+	local targetHumanoid = targetCharacter:FindFirstChildOfClass("Humanoid")
+	if not targetRoot or not targetHumanoid or targetHumanoid.Health <= 0 then
+		context.target = nil
+		context.path:Stop()
+		setState(context, "Idle")
+		return
+	end
+	local distance = (targetRoot.Position - context.root.Position).Magnitude
+	local canSee = canSeeTarget(context.npc, context.head, targetCharacter)
+	updateBodyGyro(context, targetRoot.Position)
+	if distance <= config.Combat.ShootRange and canSee then
+		context.path:Stop()
+		fireAtTarget(context, targetRoot)
+		return
+	end
+	if context.pathAccumulator >= config.Movement.PathUpdateInterval then
+		context.pathAccumulator = 0
+		context.path:Run(targetRoot.Position)
+	end
+	setState(context, "Walk")
+end
+
+local function ensureHeartbeat()
+	if HEARTBEAT_CONNECTION then
+		return
+	end
+	HEARTBEAT_CONNECTION = RunService.Heartbeat:Connect(function(dt)
+		for _, context in pairs(REG) do
+			updateOneNPC(context, dt)
+		end
+		if next(REG) == nil and HEARTBEAT_CONNECTION then
+			HEARTBEAT_CONNECTION:Disconnect()
+			HEARTBEAT_CONNECTION = nil
 		end
 	end)
 end
-function dashAI(npc, directionVector)
-	if not npc or not npc:FindFirstChild("HumanoidRootPart") or not npc:FindFirstChildOfClass("Humanoid") then
-		warn("Invalid NPC or missing components for dash.")
-		return
-	end
-	local npchumanoid = npc:FindFirstChildOfClass("Humanoid")
-	local rootPart = npc:FindFirstChild("HumanoidRootPart")
-	local slideAnim = Instance.new("Animation")
-	slideAnim.AnimationId = "rbxassetid://101766464614422" 
-	local playAnim = npchumanoid:LoadAnimation(slideAnim)
-	playAnim:Play()
-	local slide = Instance.new("BodyVelocity")
-	slide.MaxForce = Vector3.new(1, 0, 1) * 35000 
-	slide.Velocity = directionVector.Unit * 100 
-	slide.Parent = rootPart
-	for count = 1, 8 do
-		wait(0.1)
-		slide.Velocity *= 0.7
-	end
-	slide:Destroy()
-	playAnim:Stop() 
-end
-local followedTarget = nil
-local followedHumanoid = nil
-local followOffsetTarget = nil
-local hasDashedOnTargetDeath = false
-local lastFollowedHumanoid = nil
-function balls()
-	local Backing = true
-	if npcFlash.Value or following then return end
 
-	while true do
-		if shooting then
-			Path:Stop()
-		elseif not npcFlash.Value then
-			if npchumanoid and npchumanoid.Health > 0 then
-				if followedTarget and followedHumanoid and followedHumanoid.Health > 0 then
-					lastFollowedHumanoid = followedHumanoid
-					hasDashedOnTargetDeath = false 
-
-					if followOffsetTarget and followOffsetTarget.PrimaryPart then
-						local offsetPos = followOffsetTarget.PrimaryPart.Position + followOffsetTarget.PrimaryPart.CFrame.LookVector * -5
-						Path:Run(offsetPos)
-					else
-						Path:Stop()
-					end
-				else
-					if lastFollowedHumanoid and lastFollowedHumanoid.Health <= 0 and not hasDashedOnTargetDeath then
-						hasDashedOnTargetDeath = true
-						following = false
-						local dashForce = 1000
-						local randomDirection = Vector3.new(math.random(-100, 100), 0, math.random(-100, 100))
-						randomDirection = randomDirection.Unit * dashForce
-						dashAI(npc, randomDirection)
-					end
-					--print("test")
-
-					followedTarget = nil
-					followedHumanoid = nil
-					followOffsetTarget = nil
-					lastFollowedHumanoid = nil
-
-					local retreatPos, torso = getback()
-					if retreatPos and torso then
-						local potentialTarget = torso.Parent
-						local follower1 = potentialTarget:FindFirstChild("Follower1")
-						local follower2 = potentialTarget:FindFirstChild("Follower2")
-
-						if follower1 and follower1:IsA("ObjectValue") and not follower1.Value then
-							follower1.Value = npc
-							following = true
-							followedTarget = potentialTarget
-							followedHumanoid = potentialTarget:FindFirstChildOfClass("Humanoid")
-							followOffsetTarget = potentialTarget
-							lastFollowedHumanoid = followedHumanoid
-							hasDashedOnTargetDeath = false
-
-							if potentialTarget.PrimaryPart then
-								local offsetPos = potentialTarget.PrimaryPart.Position + potentialTarget.PrimaryPart.CFrame.LookVector * -5
-								Path:Run(offsetPos)
-							end
-						elseif follower2 and follower2:IsA("ObjectValue") and not follower2.Value and follower1 and follower1.Value then
-							follower2.Value = npc
-							following = true
-							followedTarget = potentialTarget
-							followedHumanoid = potentialTarget:FindFirstChildOfClass("Humanoid")
-							followOffsetTarget = follower1.Value
-							lastFollowedHumanoid = followedHumanoid
-							hasDashedOnTargetDeath = false
-
-							if followOffsetTarget.PrimaryPart then
-								local offsetPos = followOffsetTarget.PrimaryPart.Position + followOffsetTarget.PrimaryPart.CFrame.LookVector * -5
-								Path:Run(offsetPos)
-							end
-						else
-							local nearestCharacter = GetNearestCharacter(npc.PrimaryPart.Position)
-							if nearestCharacter and nearestCharacter.PrimaryPart then
-								Backing = false
-								Path:Run(nearestCharacter.PrimaryPart)
-							else
-								Path:Stop()
-							end
-						end
-					else
-						local nearestCharacter = GetNearestCharacter(npc.PrimaryPart.Position)
-						if nearestCharacter and nearestCharacter.PrimaryPart then
-							Backing = false
-							Path:Run(nearestCharacter.PrimaryPart)
-						else
-							Path:Stop()
-						end
-					end
-				end
-			else
-				break
-			end
-		end
-		task.wait()
-	end
-end
-
-function checker()
-	local flashed = {
-		-- Disoriented/Shocked Reactions
-		"Ahh! I can't see!",
-		"Damn it! I'm blind!",
-		"What the hell was that?!",
-		"Ugh... my eyes!",
-		"Everything’s white!",
-		"I can’t see a thing!",
-		"Where did that come from?!",
-		"I’m completely blind!",
-		"Who threw that?!",
-		"I need a second to recover!",
-		-- Angry/Frustrated Reactions
-		"Cheap move, coward!",
-		"You think that’ll stop me?!",
-		"Damn flashbangs!",
-		"Fight me properly!",
-		"That was dirty!",
-		"You’re gonna pay for that!",
-		"I swear, when I can see again...",
-		"Ugh, not this again!",
-		"I hate these things!",
-		"Flashbang?! Really?!",
-		-- Confused/Disoriented Reactions
-		"Where am I?!",
-		"Who turned out the lights?!",
-		"What’s happening?!",
-		"I can’t tell where anything is!",
-		"Someone guide me!",
-		"Did I just go blind?!",
-		"I can hear you, but I can’t see you!",
-		"Which way is up?!",
-		"Everything’s spinning!",
-		"Where did everyone go?!"
-	}
-	local wasflashed = false
-	local originalWalkSpeed = npchumanoid.WalkSpeed 
-	while true do
-		if npcFlash.Value and not wasflashed then
-			print(npc.Name .. " is flashed!")
-			wasflashed = true
-			originalWalkSpeed = npchumanoid.WalkSpeed 
-			npchumanoid.WalkSpeed = 0
-			local randomText5 = flashed[math.random(1, #flashed)]
-			createTextLabel(npc, randomText5, 24, Color3.fromRGB(255, 255, 255), Color3.fromRGB(0, 0, 0))
-			repeat task.wait(0.1) until not npcFlash.Value
-			print(npc.Name .. " is no longer flashed!")
-			npchumanoid.WalkSpeed = originalWalkSpeed
-			wasflashed = false
-		end
-		task.wait(0.1)
-	end
-end
-function grenadeChecker()
-	local hasGrenade = false  
-	local grenadewarn = {
-		-- Urgent/Shouting Warnings
-		"Grenade! Take cover!",
-		"Frag out! Move!",
-		"Incoming grenade! Get down!",
-		"Watch out, grenade!",
-		"Move it! Grenade inbound!",
-		"Scatter! Grenade!",
-		"Get clear! Grenade!",
-		"Grenade! Don’t just stand there!",
-		"Everyone, out of the blast zone!",
-		"Find cover, now!",
-		-- Tactical/Directed Warnings
-		"Grenade spotted! Fall back!",
-		"Explosive incoming, watch your step!",
-		"Eyes on a grenade, reposition!",
-		"Hostile just tossed a grenade!",
-		"Danger close! Move out!",
-		"Stay out of the blast radius!",
-		"Grenade near our position!",
-		"That grenade’s too close! Shift positions!",
-		"We need to move—now!",
-		"Spread out, avoid the explosion!",
-		-- Panicked/Fearful Warnings
-		"Oh crap, grenade!",
-		"That’s gonna blow! Move!",
-		"We’re dead if we don’t move!",
-		"No no no—grenade!",
-		"Run! It’s right there!",
-		"We’re sitting ducks!",
-		"Too late to throw it back! RUN!",
-		"I hate grenades!",
-		"We are so screwed!",
-		"Why is it always grenades?!"
-	}
-	local randomText5 = grenadewarn[math.random(1, #grenadewarn)]
-	while true do
-		local hrp = npc:FindFirstChild("HumanoidRootPart") 
-		if not hrp then
-			warn(npc.Name .. " is missing HumanoidRootPart!")
-			task.wait(1)
-			continue
-		end
-		local npcPosition = hrp.Position
-		local dash = false
-		local chance = math.random()
-		local grenadeFound = false  
-		for _, obj in pairs(workspace:GetChildren()) do
-			if obj:IsA("BasePart") and obj.Name == "Grenade" then
-				local distance = (obj.Position - npcPosition).Magnitude
-				if distance <= 25 then
-					grenadeFound = true  
-					if not hasGrenade then  
-						
-						hasGrenade = true
-						print(npc.Name .. " detected a Grenade! Taking action...")
-						createTextLabel(npc, randomText5, 24, Color3.fromRGB(255, 255, 255), Color3.fromRGB(0, 0, 0))
-						
-							shooting = false
-							walking = false
-							local dashForce = 1000
-							local randomDirection = Vector3.new(math.random(-100, 100), 0, math.random(-100, 100))
-							randomDirection = randomDirection.Unit * dashForce
-							dashAI(npc,randomDirection) 
-							--npchumanoid.WalkSpeed = 25
-							print("dashing")
-						
-						task.delay(5, function()
-							if hasGrenade then
-								hasGrenade = false
-								print(npc.Name .. " is now safe. Resuming normal behavior.")
-							end
-						end)
-					end
-					break 
-				end
-			end
-		end
-		task.wait(0.1)  
-	end
-end
-local knockbackForce = 50 
-local knockbackDuration = 0.2
-local ragdollDuration = 2
-animationTrack:GetMarkerReachedSignal("Knockback"):Connect(function()
-	local npcRoot = npc:FindFirstChild("HumanoidRootPart") or npc.PrimaryPart 
-	if not npcRoot then return end
-	for _, player in pairs(game:GetService("Players"):GetPlayers()) do
-		local character = player.Character
-		if character then
-			local rootPart = character:FindFirstChild("HumanoidRootPart")
-			local humanoid = character:FindFirstChildOfClass("Humanoid")
-			if rootPart and humanoid then
-				local distance = (rootPart.Position - npcRoot.Position).Magnitude
-				if distance <= 5 then
-					local knockbackDirection = (rootPart.Position - npcRoot.Position).unit
-					local force = Instance.new("BodyVelocity")
-					force.Velocity = Vector3.new(knockbackDirection.X * knockbackForce, 25, knockbackDirection.Z * knockbackForce) 
-					force.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
-					force.Parent = rootPart
-					game:GetService("Debris"):AddItem(force, knockbackDuration)
-					local disabledJoints = {}
-					for _, desc in pairs(character:GetDescendants()) do
-						if desc:IsA("Motor6D") and desc.Parent:IsA("BasePart") then
-							local partName = desc.Parent.Name
-							if partName == "Left Arm" or partName == "Right Arm" or partName == "Left Leg" or partName == "Right Leg" or partName == "Head" then
-								desc.Enabled = false
-								table.insert(disabledJoints, desc) 
-							end
-						end
-					end
-					humanoid.PlatformStand = true
-					task.delay(ragdollDuration, function()
-						if humanoid and humanoid.Parent then
-							humanoid.PlatformStand = false
-							for _, joint in pairs(disabledJoints) do
-								if joint.Parent then
-									joint.Enabled = true
-								end
-							end
-						end
-					end)
-				end
-			end
-		end
-	end
-end)
-
-function death()
-	local cadetdeath = {
-		"I just got here...",
-		"This wasn’t part of training...",
-		"I wasn’t ready for this...",
-		"They said we’d be safe...",
-		"I should’ve stayed in the barracks...",
-		"This isn’t how I wanted my first mission to go...",
-		"I didn’t even get my first promotion...",
-		"So much for making it through boot camp...",
-		"I thought I had more time to learn...",
-		"Why did I sign up for this...",
-		"I should’ve listened to my instructor...",
-		"This was supposed to be a routine mission...",
-		"I never even got to prove myself...",
-		"I didn’t expect my first fight to be my last...",
-		"I should’ve trained harder...",
-		"I never even got a chance to shine...",
-		"This was just the beginning... how can it already be over...",
-		"Tell the others… to keep fighting…",
-		"Guess I wasn’t cut out for this...",
-		"I thought war would be different...",
-		"Mom... Dad... I'm sorry...",
-		"I should’ve listened to my parents...",
-		"I just wanted to make them proud...",
-		"Tell my family... I tried my best...",
-		"I wasn’t supposed to go out like this...",
-		"I promised my parents I'd come home...",
-		"Mom always told me this was a bad idea... she was right...",
-		"Dad... I finally got to be like you... but I won’t make it back...",
-		"I wanted to prove myself... now they’ll never know...",
-		"I should’ve written back to them...",
-		"I told them I’d be fine... I was wrong...",
-		"I thought I’d have time to visit home again...",
-		"Will they even know what happened to me...?",
-		"Mom, Dad... I didn’t mean for it to end this way...",
-		"I hope they don’t get that letter...",
-		"All that training... all that hope... wasted...",
-		"I never even got to tell them I loved them...",
-		"I should’ve stayed home...",
-		"I just wanted them to see me as a hero...",
-		"I wish I could tell them goodbye..."
-	}
-	local death = cadetdeath[math.random(1, #cadetdeath)]
-	if npc:findFirstChild("Health") then
+local function handleNPCDeath(npc: Model, humanoid: Humanoid)
+	REG[npc] = nil
+	CONFIG[npc] = nil
+	if npc:FindFirstChild("Health") and npc.Health:IsA("Script") then
 		npc.Health.Disabled = true
 	end
-	npchumanoid.Archivable = true
-	local zombiecorpse = npchumanoid.Parent:Clone()
-	npchumanoid.Parent:destroy()
-	zombiecorpse.Parent = workspace
-	game.Debris:AddItem(zombiecorpse, 15)
-	local Humanoid = zombiecorpse:findFirstChildOfClass("Humanoid")
-	local Torso = zombiecorpse.Torso
-	Humanoid.PlatformStand = true
-	Humanoid:SetStateEnabled("Dead", false)
-	for i,v in pairs(Humanoid.Parent.Torso:GetChildren()) do
-		if v.ClassName == 'Motor6D' or v.ClassName == 'Weld' then
-			v:destroy()
+	humanoid.Archivable = true
+	local zombiecorpse = npc:Clone()
+	local weldConstraints = {}
+	for _, weld in ipairs(zombiecorpse:GetDescendants()) do
+		if weld:IsA("WeldConstraint") then
+			table.insert(weldConstraints, {weld = weld, part0 = weld.Part0, part1 = weld.Part1})
 		end
 	end
-	for i,v in pairs(zombiecorpse:GetChildren()) do
-		if v.ClassName == "Part" then
-			for q,w in pairs(v:GetChildren()) do
-				if w.ClassName == "BodyPosition" or w.ClassName == "BodyVelocity" then
-					w:destroy()
+	for _, descendant in ipairs(zombiecorpse:GetDescendants()) do
+		if (descendant:IsA("Script") or descendant:IsA("LocalScript")) and descendant.Name ~= "balls" then
+			descendant:Destroy()
+		end
+	end
+	npc:Destroy()
+	for _, data in ipairs(weldConstraints) do
+		if data.part0 and data.part1 then
+			data.weld.Part0 = data.part0
+			data.weld.Part1 = data.part1
+			data.weld.Enabled = true
+		end
+	end
+	zombiecorpse.Parent = workspace
+	Debris:AddItem(zombiecorpse, 15)
+	local corpseHumanoid = zombiecorpse:FindFirstChildOfClass("Humanoid")
+	local torso = zombiecorpse:FindFirstChild("Torso")
+	if not corpseHumanoid or not torso or not torso:IsA("BasePart") then
+		return
+	end
+	corpseHumanoid.PlatformStand = true
+	corpseHumanoid:SetStateEnabled(Enum.HumanoidStateType.Dead, false)
+	for _, v in pairs(torso:GetChildren()) do
+		if v:IsA("Motor6D") or v:IsA("Weld") then
+			v:Destroy()
+		end
+	end
+	local head = zombiecorpse:FindFirstChild("Head")
+	if head then
+		for _, v in pairs(head:GetChildren()) do
+			if v:IsA("Weld") then
+				v:Destroy()
+			end
+		end
+	end
+	for _, v in pairs(zombiecorpse:GetChildren()) do
+		if v:IsA("Part") then
+			for _, w in pairs(v:GetChildren()) do
+				if w:IsA("BodyPosition") or w:IsA("BodyVelocity") then
+					w:Destroy()
 				end
 			end
 		end
 	end
-	local serverStorage = game:GetService("ServerStorage")
-	local itemToDrop = ReplicatedStorage.Assets.Items:FindFirstChild("M16") 
-	if itemToDrop and itemToDrop:IsA("Tool") then
-		local clonedItem = itemToDrop:Clone()
-		if not Torso then
-			warn("Torso part not found!")
-			return
-		end
-		local handle = clonedItem:FindFirstChild("Handle") or clonedItem:FindFirstChild("MeshPart")
-		if handle and handle:IsA("BasePart") then
-			handle.Position = Torso.Position + Vector3.new(0, 2, 0)
-			handle.Anchored = false 
-			handle.CanCollide = true 
-		else
-			warn("Tool does not have a valid Handle or MeshPart!")
-		end
-		for _, part in ipairs(clonedItem:GetChildren()) do
-			if part:IsA("BasePart") and part ~= handle then
-				part.Anchored = false 
-				part.CanCollide = true 
-				part.Position = Torso.Position + Vector3.new(0, 2, 0)
-			end
-		end
-		clonedItem.Parent = workspace
-		print("Dropped tool on corpse:", clonedItem.Name)
-	else
-		warn("Item not found in ServerStorage or is not a Tool!")
-	end
-	
-	local function makeconnections(limb, attachementone, attachmenttwo, twistlower, twistupper, upperangle)
-		local connection = Instance.new('BallSocketConstraint', limb)
+	local function makeconnections(limb: BasePart, attachementone: Attachment, attachmenttwo: Attachment, twistlower: number, twistupper: number)
+		local connection = Instance.new("BallSocketConstraint", limb)
 		connection.LimitsEnabled = true
 		connection.Attachment0 = attachementone
 		connection.Attachment1 = attachmenttwo
@@ -1151,130 +652,184 @@ function death()
 		connection.TwistUpperAngle = twistupper
 		connection.UpperAngle = 70
 	end
-	local function makehingeconnections(limb, attachementone, attachmenttwo, twistlower, twistupper, upperangle)
-		local connection = Instance.new('HingeConstraint', limb)
+	local function makehingeconnections(limb: BasePart, attachementone: Attachment, attachmenttwo: Attachment, twistlower: number, twistupper: number)
+		local connection = Instance.new("HingeConstraint", limb)
 		connection.Attachment0 = attachementone
 		connection.Attachment1 = attachmenttwo
 		connection.LimitsEnabled = true
 		connection.LowerAngle = twistlower
 		connection.UpperAngle = twistupper
 	end
-	Humanoid.Parent['Right Arm'].RightShoulderAttachment.Position = Vector3.new(0, 0.5, 0)
-	Torso.RightCollarAttachment.Position = Vector3.new(1.5, 0.5, 0)
-	Humanoid.Parent['Left Arm'].LeftShoulderAttachment.Position = Vector3.new(0, 0.5, 0)
-	Torso.LeftCollarAttachment.Position = Vector3.new(-1.5, 0.5, 0)
-	local RightLegAttachment = Instance.new("Attachment", Humanoid.Parent["Right Leg"])
-	RightLegAttachment.Position = Vector3.new(0, 1, 0)
-	local TorsoRightLegAttachment = Instance.new("Attachment", Torso)
-	TorsoRightLegAttachment.Position = Vector3.new(0.5, -1, 0)
-	--
-	local LeftLegAttachment = Instance.new("Attachment", Humanoid.Parent["Left Leg"])
-	LeftLegAttachment.Position = Vector3.new(0, 1, 0)
-	local TorsoLeftLegAttachment = Instance.new("Attachment", Torso)
-	TorsoLeftLegAttachment.Position = Vector3.new(-0.5, -1, 0)
-	--
-	if Humanoid.Parent:findFirstChild("Head") then
-		local HeadAttachment = Instance.new("Attachment", Humanoid.Parent.Head)
-		HeadAttachment.Position = Vector3.new(0, -0.5, 0)
-		makehingeconnections(Humanoid.Parent.Head, HeadAttachment, Torso.NeckAttachment, -20, 20, 70)
+	local rightArm = zombiecorpse:FindFirstChild("Right Arm")
+	local leftArm = zombiecorpse:FindFirstChild("Left Arm")
+	local rightLeg = zombiecorpse:FindFirstChild("Right Leg")
+	local leftLeg = zombiecorpse:FindFirstChild("Left Leg")
+	if rightArm and rightArm:IsA("BasePart") and rightArm:FindFirstChild("RightShoulderAttachment") and torso:FindFirstChild("RightCollarAttachment") then
+		rightArm.RightShoulderAttachment.Position = Vector3.new(0, 0.5, 0)
+		torso.RightCollarAttachment.Position = Vector3.new(1.5, 0.5, 0)
 	end
-	makeconnections(Humanoid.Parent['Right Arm'], Humanoid.Parent['Right Arm'].RightShoulderAttachment, Torso.RightCollarAttachment, -80, 80)
-	makeconnections(Humanoid.Parent['Left Arm'], Humanoid.Parent['Left Arm'].LeftShoulderAttachment, Torso.LeftCollarAttachment, -80, 80)
-	makeconnections(Humanoid.Parent['Right Leg'], RightLegAttachment, TorsoRightLegAttachment, -80, 80, 70)
-	makeconnections(Humanoid.Parent['Left Leg'], LeftLegAttachment, TorsoLeftLegAttachment, -80, 80, 70)
-	if Humanoid.Parent:findFirstChild("Right Arm") then
-		local limbcollider = Instance.new("Part", Humanoid.Parent["Right Arm"])
-		limbcollider.Size = Vector3.new(1,1.3,1)
-		limbcollider.Shape = "Cylinder"
+	if leftArm and leftArm:IsA("BasePart") and leftArm:FindFirstChild("LeftShoulderAttachment") and torso:FindFirstChild("LeftCollarAttachment") then
+		leftArm.LeftShoulderAttachment.Position = Vector3.new(0, 0.5, 0)
+		torso.LeftCollarAttachment.Position = Vector3.new(-1.5, 0.5, 0)
+	end
+	if rightLeg and rightLeg:IsA("BasePart") then
+		local rightLegAttachment = Instance.new("Attachment", rightLeg)
+		rightLegAttachment.Position = Vector3.new(0, 1, 0)
+		local torsoRightLegAttachment = Instance.new("Attachment", torso)
+		torsoRightLegAttachment.Position = Vector3.new(0.5, -1, 0)
+		makeconnections(rightLeg, rightLegAttachment, torsoRightLegAttachment, -80, 80)
+	end
+	if leftLeg and leftLeg:IsA("BasePart") then
+		local leftLegAttachment = Instance.new("Attachment", leftLeg)
+		leftLegAttachment.Position = Vector3.new(0, 1, 0)
+		local torsoLeftLegAttachment = Instance.new("Attachment", torso)
+		torsoLeftLegAttachment.Position = Vector3.new(-0.5, -1, 0)
+		makeconnections(leftLeg, leftLegAttachment, torsoLeftLegAttachment, -80, 80)
+	end
+	if head and head:IsA("BasePart") and torso:FindFirstChild("NeckAttachment") then
+		local headAttachment = Instance.new("Attachment", head)
+		headAttachment.Position = Vector3.new(0, -0.5, 0)
+		makehingeconnections(head, headAttachment, torso.NeckAttachment, -20, 20)
+	end
+	if rightArm and rightArm:IsA("BasePart") and rightArm:FindFirstChild("RightShoulderAttachment") and torso:FindFirstChild("RightCollarAttachment") then
+		makeconnections(rightArm, rightArm.RightShoulderAttachment, torso.RightCollarAttachment, -80, 80)
+		local limbcollider = Instance.new("Part", rightArm)
+		limbcollider.Size = Vector3.new(1, 1.3, 1)
+		limbcollider.Shape = Enum.PartType.Cylinder
 		limbcollider.Transparency = 1
 		local limbcolliderweld = Instance.new("Weld", limbcollider)
-		limbcolliderweld.Part0 = Humanoid.Parent["Right Arm"]
+		limbcolliderweld.Part0 = rightArm
 		limbcolliderweld.Part1 = limbcollider
-		limbcolliderweld.C0 = CFrame.fromEulerAnglesXYZ(0,0,math.pi/2) * CFrame.new(-0.4,0,0)
-		for i,v in pairs(zombiecorpse["Right Arm"]:GetChildren()) do
-			if v.ClassName == 'Motor6D' or v.ClassName == 'Weld' then
-				v:destroy()
+		limbcolliderweld.C0 = CFrame.fromEulerAnglesXYZ(0, 0, math.pi / 2) * CFrame.new(-0.4, 0, 0)
+		for _, v in pairs(rightArm:GetChildren()) do
+			if v:IsA("Motor6D") or v:IsA("Weld") then
+				v:Destroy()
 			end
 		end
 	end
-	local gun = Humanoid.Parent:findFirstChild("M16")
-	if Humanoid.Parent:findFirstChild("M16") then
-		gun:destroy()
-	end
-	if Humanoid.Parent:findFirstChild("Left Arm") then
-		local limbcollider = Instance.new("Part", Humanoid.Parent["Left Arm"])
-		limbcollider.Size = Vector3.new(1,1.3,1)
-		limbcollider.Shape = "Cylinder"
+	if leftArm and leftArm:IsA("BasePart") and leftArm:FindFirstChild("LeftShoulderAttachment") and torso:FindFirstChild("LeftCollarAttachment") then
+		makeconnections(leftArm, leftArm.LeftShoulderAttachment, torso.LeftCollarAttachment, -80, 80)
+		local limbcollider = Instance.new("Part", leftArm)
+		limbcollider.Size = Vector3.new(1, 1.3, 1)
+		limbcollider.Shape = Enum.PartType.Cylinder
 		limbcollider.Transparency = 1
 		local limbcolliderweld = Instance.new("Weld", limbcollider)
-		limbcolliderweld.Part0 = Humanoid.Parent["Left Arm"]
+		limbcolliderweld.Part0 = leftArm
 		limbcolliderweld.Part1 = limbcollider
-		limbcolliderweld.C0 = CFrame.fromEulerAnglesXYZ(0,0,math.pi/2) * CFrame.new(-0.4,0,0)
+		limbcolliderweld.C0 = CFrame.fromEulerAnglesXYZ(0, 0, math.pi / 2) * CFrame.new(-0.4, 0, 0)
 	end
-	--
-	if Humanoid.Parent:findFirstChild("Left Leg") then
-		local limbcollider = Instance.new("Part", Humanoid.Parent["Left Leg"])
-		limbcollider.Size = Vector3.new(1,1.3,1)
-		limbcollider.Shape = "Cylinder"
+	if leftLeg and leftLeg:IsA("BasePart") then
+		local limbcollider = Instance.new("Part", leftLeg)
+		limbcollider.Size = Vector3.new(1, 1.3, 1)
+		limbcollider.Shape = Enum.PartType.Cylinder
 		limbcollider.Transparency = 1
 		local limbcolliderweld = Instance.new("Weld", limbcollider)
-		limbcolliderweld.Part0 = Humanoid.Parent["Left Leg"]
+		limbcolliderweld.Part0 = leftLeg
 		limbcolliderweld.Part1 = limbcollider
-		limbcolliderweld.C0 = CFrame.fromEulerAnglesXYZ(0,0,math.pi/2) * CFrame.new(-0.4,0,0)
+		limbcolliderweld.C0 = CFrame.fromEulerAnglesXYZ(0, 0, math.pi / 2) * CFrame.new(-0.4, 0, 0)
 	end
-	--
-	if Humanoid.Parent:findFirstChild("Right Leg") then
-		local limbcollider = Instance.new("Part", Humanoid.Parent["Right Leg"])
-		limbcollider.Size = Vector3.new(1,1.3,1)
-		limbcollider.Shape = "Cylinder"
+	if rightLeg and rightLeg:IsA("BasePart") then
+		local limbcollider = Instance.new("Part", rightLeg)
+		limbcollider.Size = Vector3.new(1, 1.3, 1)
+		limbcollider.Shape = Enum.PartType.Cylinder
 		limbcollider.Transparency = 1
 		local limbcolliderweld = Instance.new("Weld", limbcollider)
-		limbcolliderweld.Part0 = Humanoid.Parent["Right Leg"]
+		limbcolliderweld.Part0 = rightLeg
 		limbcolliderweld.Part1 = limbcollider
-		limbcolliderweld.C0 = CFrame.fromEulerAnglesXYZ(0,0,math.pi/2) * CFrame.new(-0.4,0,0)
+		limbcolliderweld.C0 = CFrame.fromEulerAnglesXYZ(0, 0, math.pi / 2) * CFrame.new(-0.4, 0, 0)
 	end
-	local ragdoll = zombiecorpse
-	if ragdoll:findFirstChild("HumanoidRootPart") then
-		ragdoll.HumanoidRootPart.CanCollide = false
-		ragdoll.HumanoidRootPart:destroy()
-	end
-end
-
-
-npchumanoid.Died:connect(death)
-spawn(checkandshoot)
-spawn(checker)
-spawn(grenadeChecker)
-spawn(balls)
---spawn(run)
---spawn(monitorFlash)
---spawn(walkToNearestPlayer)
-while wait() do
-	if currentAnimTrack and not shooting then
-		currentAnimTrack:Stop()
-	end
-	if not walking and not (shooting or kicking) then
-		local idleAnim = Instance.new("Animation")
-		idleAnim.AnimationId = "rbxassetid://98564293923592"
-		currentAnimTrack = npchumanoid:LoadAnimation(idleAnim)
-		currentAnimTrack:Play()
-	elseif walking and not kicking then
-		local walkAnim = Instance.new("Animation")
-		walkAnim.AnimationId = "rbxassetid://119334489267419"
-		currentAnimTrack = npchumanoid:LoadAnimation(walkAnim)
-		currentAnimTrack:Play()
-	elseif shooting and not kicking then
-		local animationIds = {
-			"rbxassetid://126320314278150",
-			"rbxassetid://109848498488419"
-		}
-		local selectedAnimId = animationIds[math.random(#animationIds)]
-		local shootAnim = Instance.new("Animation")
-		shootAnim.AnimationId = selectedAnimId
-		currentAnimTrack = npchumanoid:LoadAnimation(shootAnim)
-		currentAnimTrack:Play()
-		while shooting do
-			wait()
+	local assets = ReplicatedStorage:FindFirstChild("Assets")
+	if assets and assets:FindFirstChild("Items") then
+		local m16 = assets.Items:FindFirstChild("M16")
+		if m16 and m16:IsA("Tool") then
+			local clone = m16:Clone()
+			clone.Parent = workspace
+			for _, part in ipairs(clone:GetDescendants()) do
+				if part:IsA("BasePart") then
+					part.Anchored = false
+					part.CanCollide = true
+					part.Position = torso.Position + Vector3.new(0, 2, 0)
+				end
+			end
 		end
 	end
+	if zombiecorpse:FindFirstChild("HumanoidRootPart") and zombiecorpse.HumanoidRootPart:IsA("BasePart") then
+		zombiecorpse.HumanoidRootPart.CanCollide = false
+		zombiecorpse.HumanoidRootPart:Destroy()
+	end
 end
+
+local function registerNPC(npc: Model)
+	if REG[npc] then
+		return
+	end
+	local humanoid = npc:FindFirstChildOfClass("Humanoid")
+	local root = npc:FindFirstChild("HumanoidRootPart")
+	local head = npc:FindFirstChild("Head")
+	if not humanoid or not root or not head then
+		warn("NPC missing required parts:", npc:GetFullName())
+		return
+	end
+	local config = resolveConfigFromModel(npc)
+	local path = SimplePath.new(npc)
+	path.Visualize = config.Debug.VisualizePath
+	local bodyGyro: BodyGyro? = nil
+	if config.Rotation.Enabled then
+		bodyGyro = Instance.new("BodyGyro")
+		bodyGyro.Name = "NPCBodyGyro"
+		bodyGyro.P = config.Rotation.P
+		bodyGyro.D = config.Rotation.D
+		bodyGyro.MaxTorque = config.Rotation.MaxTorque
+		bodyGyro.CFrame = root.CFrame
+		bodyGyro.Parent = root
+	end
+	local context: NPCContext = {
+		npc = npc,
+		humanoid = humanoid,
+		root = root,
+		head = head,
+		animator = getAnimator(humanoid),
+		animationCache = {},
+		currentTrack = nil,
+		state = "",
+		ammo = 0,
+		reloading = false,
+		lastShotTime = 0,
+		target = nil,
+		path = path,
+		flashTag = npc:FindFirstChild("Flashed"),
+		pathAccumulator = 0,
+		targetAccumulator = 0,
+		bodyGyro = bodyGyro,
+	}
+	REG[npc] = context
+	setState(context, "Idle", true)
+	humanoid.Died:Connect(function()
+		handleNPCDeath(npc, humanoid)
+	end)
+end
+
+function Controller.Start(npcOrList)
+	if typeof(npcOrList) == "Instance" then
+		if npcOrList:IsA("Model") then
+			registerNPC(npcOrList)
+		elseif npcOrList:IsA("Folder") then
+			for _, child in ipairs(npcOrList:GetChildren()) do
+				if child:IsA("Model") then
+					registerNPC(child)
+				end
+			end
+		end
+	elseif typeof(npcOrList) == "table" then
+		for _, npc in ipairs(npcOrList) do
+			if typeof(npc) == "Instance" and npc:IsA("Model") then
+				registerNPC(npc)
+			end
+		end
+	else
+		error("Start expects a Model, Folder, or array of Models")
+	end
+	ensureHeartbeat()
+end
+
+return Controller
