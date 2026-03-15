@@ -1,1 +1,845 @@
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local ServerStorage = game:GetService("ServerStorage") -- From 28Pixels
+local ReplicatedStorage = game:GetService("ReplicatedStorage") -- From 28Pixels
 
+local _toolMethods = require(ReplicatedStorage.MODULES.ToolModule._toolMethods)  -- From 28Pixels; using it to set up Motor6Ds on newly creatd NPCs
+local SimplePath = require(game.ServerScriptService.MODULES.SimplePath)
+local module = {}
+local packet = require(game.ReplicatedStorage.REFERENCES.PacketReference)
+module.HeadAimOffset = Vector3.new(5, 0, 0)
+
+
+type AnimationMeta = {
+	id: string,
+	isViewmodel: boolean,
+}
+
+type NPCData = {
+	npc: Model,
+	humanoid: Humanoid,
+	Path: any,
+	root: BasePart,
+	head: BasePart,
+	animator: Animator,
+	animationCache: {[string]: AnimationTrack},
+	animationMeta: {[string]: AnimationMeta},
+	currentTrack: AnimationTrack?,
+	state: string,
+	Inaccuracy: boolean,
+	meleeMode: boolean,
+	lastShotTime: number,
+	target: Model?,
+	gun: ObjectValue?,
+	bodyGyro: BodyGyro?,
+	timeSeeingTarget: number,
+	fireQueued: boolean,
+	team: string,
+}
+
+type NPCConfig = {
+	Animations: {[string]: any},
+}
+
+
+local REG: {[Model]: NPCData} = {}
+
+local CONTROL_CONNECTION: RBXScriptConnection? = nil
+local TARGET_REFRESH_INTERVAL = 0.2
+local TARGET_REFRESH_ACCUM = 0
+local NEAREST_PLAYER_POSITION: {[Model]: Vector3} = {}
+local FIRE_AFTER_SECONDS = 2
+
+local function parseAnimationSpec(spec: any): AnimationMeta
+	if type(spec) == "string" then
+		return { id = spec, isViewmodel = false }
+	end
+
+	if type(spec) == "table" then
+		local id = spec[1] or spec.id or spec.AnimationId
+		local isViewmodel = spec[2]
+		if isViewmodel == nil then
+			isViewmodel = spec.isViewmodel or spec.Viewmodel or spec.IsViewmodel
+		end
+		if type(id) == "string" then
+			return {
+				id = id,
+				isViewmodel = isViewmodel == true,
+			}
+		end
+	end
+
+	error("Invalid animation config. Expected string or {id, isViewmodel}.")
+end
+
+local function loadconfig(npc: Model, animator: Animator): ({[string]: any}, {[string]: any})
+	local configModule = npc:FindFirstChild("Config")
+	if not configModule or not configModule:IsA("ModuleScript") then
+		error("initializeNPC: missing Config ModuleScript")
+	end
+
+	local config = require(configModule) :: NPCConfig
+	local animations = config.Animations
+	if not animations then
+		error("initializeNPC: Config missing Animations table")
+	end
+
+	local animationCache = {}
+	local animationMeta = {}
+
+	local function loadTable(tbl)
+		local cache = {}
+		local metaTbl = {}
+
+		for animationName, animationSpec in pairs(tbl) do
+			if type(animationSpec) == "table" and animationSpec[1] == nil then
+				cache[animationName], metaTbl[animationName] = loadTable(animationSpec)
+			else
+				local meta = parseAnimationSpec(animationSpec)
+				local animation = Instance.new("Animation")
+				animation.Name = animationName
+				animation.AnimationId = meta.id
+				cache[animationName] = animator:LoadAnimation(animation)
+				metaTbl[animationName] = meta
+			end
+		end
+
+		return cache, metaTbl
+	end
+
+	animationCache, animationMeta = loadTable(animations)
+
+	return animationCache, animationMeta
+end
+local function loadstats(data: NPCData)
+	local configModule = data.npc:FindFirstChild("Config")
+	if not configModule or not configModule:IsA("ModuleScript") then
+		return
+	end
+
+	local ok, config = pcall(require, configModule)
+	if not ok or type(config) ~= "table" then
+		return
+	end
+
+	local configs = config.Configurations
+	if type(configs) ~= "table" then
+		return
+	end
+
+	for statName, value in pairs(configs) do
+		data[statName] = value
+		print(value)
+	end
+end
+local function getNeckMotor(npc: Model): Motor6D?
+	local head = npc:FindFirstChild("Head")
+	if head and head:IsA("BasePart") then
+		local headNeck = head:FindFirstChild("Neck")
+		if headNeck and headNeck:IsA("Motor6D") then
+			return headNeck
+		end
+	end
+
+	local upperTorso = npc:FindFirstChild("UpperTorso")
+	if upperTorso and upperTorso:IsA("BasePart") then
+		local neck = upperTorso:FindFirstChild("Neck")
+		if neck and neck:IsA("Motor6D") then
+			return neck
+		end
+	end
+
+	local torso = npc:FindFirstChild("Torso")
+	if torso and torso:IsA("BasePart") then
+		local neck = torso:FindFirstChild("Neck")
+		if neck and neck:IsA("Motor6D") then
+			return neck
+		end
+	end
+
+	return nil
+end
+
+local function resolveViewmodelState(npc: Model): ViewmodelState
+	local data = REG[npc]
+	if not data then
+		return {
+			stateType = "normal",
+			isViewmodelEnabled = false,
+			isHeadDisabled = false,
+			isLeftArmDisabled = false,
+		}
+	end
+
+	local vmEnabled = data.npc:GetAttribute("ViewmodelEnabled") == true
+	local tool = data.gun and data.gun.Value
+	local disableNow = tool and tool:GetAttribute("_DisableNow") == true
+
+	return {
+		stateType = if vmEnabled and data.humanoid.Health > 0 then "viewmodel" else "normal",
+		isViewmodelEnabled = vmEnabled,
+		isHeadDisabled = if disableNow and tool then tool:GetAttribute("_DisableHead") == true else false,
+		isLeftArmDisabled = if disableNow and tool then tool:GetAttribute("_DisableLeftArm") == true else false,
+	}
+end
+
+local function getTorsoMotor6Ds(torso: BasePart): {[string]: Motor6D}
+	local torsoMotor6Ds: {[string]: Motor6D} = {}
+	for _, motor6D in torso:GetChildren() do
+		if motor6D:IsA("Motor6D") then
+			torsoMotor6Ds[motor6D.Name] = motor6D
+		end
+	end
+	return torsoMotor6Ds
+end
+
+local function applyViewmodelMotorState(state: ViewmodelState, npc: Model)
+	local data = REG[npc]
+	if not data then
+		return
+	end
+
+	local torso = data.npc:FindFirstChild("Torso")
+	local vm = data.npc:FindFirstChild("Viewmodel")
+	if not torso or not torso:IsA("BasePart") or not vm then
+		return
+	end
+
+	local tool = data.gun and data.gun.Value
+	local torsoMotor6Ds = getTorsoMotor6Ds(torso)
+
+	if torsoMotor6Ds["GunMotor6D"] then
+		torsoMotor6Ds["GunMotor6D"].Enabled = false
+	end
+	if torsoMotor6Ds["MeleeMotor6D"] then
+		torsoMotor6Ds["MeleeMotor6D"].Enabled = false
+	end
+	if torso:FindFirstChild("Right Shoulder") then
+		(torso["Right Shoulder"] :: Motor6D).Enabled = false
+	end
+
+	if tool and tool:GetAttribute("_DisableNow") == true then
+		if vm:FindFirstChild("LeftArm") then
+			(vm.LeftArm :: Motor6D).Enabled = not state.isLeftArmDisabled
+		end
+		if vm:FindFirstChild("vm_Head") then
+			(vm.vm_Head :: Motor6D).Enabled = not state.isHeadDisabled
+		end
+		if torso:FindFirstChild("Left Shoulder") then
+			(torso["Left Shoulder"] :: Motor6D).Enabled = state.isLeftArmDisabled
+		end
+	else
+		if torso:FindFirstChild("Left Shoulder") then
+			(torso["Left Shoulder"] :: Motor6D).Enabled = false
+		end
+		if vm:FindFirstChild("LeftArm") then
+			(vm.LeftArm :: Motor6D).Enabled = true
+		end
+		if vm:FindFirstChild("vm_Head") then
+			(vm.vm_Head :: Motor6D).Enabled = true
+		end
+	end
+
+	if vm:FindFirstChild("vm_GunMotor6D") then
+		(vm.vm_GunMotor6D :: Motor6D).Enabled = true
+	end
+	if vm:FindFirstChild("RightArm") then
+		(vm.RightArm :: Motor6D).Enabled = true
+	end
+	if torso:FindFirstChild("Neck") then
+		(torso["Neck"] :: Motor6D).Enabled = false
+	end
+end
+
+local function applyNormalMotorState(npc: Model)
+	local data = REG[npc]
+	if not data then
+		return
+	end
+
+	local torso = data.npc:FindFirstChild("Torso")
+	local vm = data.npc:FindFirstChild("Viewmodel")
+	if not torso or not torso:IsA("BasePart") or not vm then
+		return
+	end
+
+	local torsoMotor6Ds = getTorsoMotor6Ds(torso)
+
+	if torso:FindFirstChild("Viewmodel") then
+		(torso.Viewmodel :: Motor6D).Enabled = true
+	end
+	if vm:FindFirstChild("vm_GunMotor6D") then
+		(vm.vm_GunMotor6D :: Motor6D).Enabled = false
+	end
+	if vm:FindFirstChild("vm_Head") then
+		(vm.vm_Head :: Motor6D).Enabled = false
+	end
+	if vm:FindFirstChild("LeftArm") then
+		(vm.LeftArm :: Motor6D).Enabled = false
+	end
+	if vm:FindFirstChild("RightArm") then
+		(vm.RightArm :: Motor6D).Enabled = false
+	end
+
+	if torsoMotor6Ds["GunMotor6D"] then
+		torsoMotor6Ds["GunMotor6D"].Enabled = true
+	end
+	if torsoMotor6Ds["MeleeMotor6D"] then
+		torsoMotor6Ds["MeleeMotor6D"].Enabled = true
+	end
+	if torso:FindFirstChild("Left Shoulder") then
+		(torso["Left Shoulder"] :: Motor6D).Enabled = true
+	end
+	if torso:FindFirstChild("Right Shoulder") then
+		(torso["Right Shoulder"] :: Motor6D).Enabled = true
+	end
+	if torso:FindFirstChild("Neck") then
+		(torso["Neck"] :: Motor6D).Enabled = true
+	end
+end
+
+local function computePitchYaw(neck: Motor6D, targetPosition: Vector3): (number, number)
+	local toTarget = targetPosition - neck.Part0.Position
+	if toTarget.Magnitude <= 0.0001 then
+		return 0, 0
+	end
+
+	local localDirection = neck.Part0.CFrame:VectorToObjectSpace(toTarget.Unit)
+	local yaw = math.atan2(-localDirection.X, -localDirection.Z)
+	local pitch = math.asin(math.clamp(localDirection.Y, -1, 1))
+
+	yaw = math.clamp(yaw, math.rad(-75), math.rad(75))
+	pitch = math.clamp(pitch, math.rad(-45), math.rad(35))
+	return pitch, yaw
+end
+
+local function getLivePlayerCharacters(): {Model}
+	local characters: {Model} = {}
+	for _, player in Players:GetPlayers() do
+		local character = player.Character
+		if character then
+		
+			local humanoid = character:FindFirstChildOfClass("Humanoid")
+			local hrp = character:FindFirstChild("HumanoidRootPart")
+			if humanoid and humanoid.Health > 0 and hrp and hrp:IsA("BasePart") then
+				table.insert(characters, character)
+				
+			end
+		end
+	end
+	return characters
+end
+
+local function canSeeCharacter(fromData: NPCData, targetCharacter: Model): boolean
+	local targetHead = targetCharacter:FindFirstChild("Head")
+	local targetRoot = targetCharacter:FindFirstChild("HumanoidRootPart")
+	local targetPart = if targetHead and targetHead:IsA("BasePart") then targetHead else targetRoot
+	if not targetPart or not targetPart:IsA("BasePart") then
+		return false
+	end
+
+	local origin = fromData.head.Position
+	local direction = targetPart.Position - origin
+	if direction.Magnitude <= 0.001 then
+		return true
+	end
+
+	local raycastParams = RaycastParams.new()
+	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+	raycastParams.FilterDescendantsInstances = { fromData.npc }
+	raycastParams.IgnoreWater = true
+
+	local hit = Workspace:Raycast(origin, direction, raycastParams)
+	if not hit then
+		return true
+	end
+
+	return hit.Instance:IsDescendantOf(targetCharacter)
+end
+local function acquireTarget(data: NPCData): Model?
+	
+	local closestCharacter: Model? = nil
+	local closestDistance = math.huge
+	local team = data.team
+
+	for _, character in getLivePlayerCharacters() do
+		local player = Players:GetPlayerFromCharacter(character)
+		if player then
+			local isEnemy = (not player.Team) or player.Team.Name ~= team
+			if isEnemy and canSeeCharacter(data, character) then
+			
+				local hrp = character:FindFirstChild("HumanoidRootPart") :: BasePart
+				if hrp then
+					local dist = (hrp.Position - data.root.Position).Magnitude
+					if dist < closestDistance then
+						closestDistance = dist
+						closestCharacter = character
+					end
+				end
+			end
+		end
+	end
+
+	return closestCharacter
+end
+local function updateNearestPlayerPositions()
+	for npc, data in REG do
+		if data.humanoid.Health > 0 and data.root.Parent ~= nil then
+			local target = acquireTarget(data)
+		
+			data.target = target
+			if target then
+				local hrp = target:FindFirstChild("HumanoidRootPart")
+				if hrp and hrp:IsA("BasePart") then
+					NEAREST_PLAYER_POSITION[npc] = hrp.Position
+				end
+			else
+				NEAREST_PLAYER_POSITION[npc] = nil
+			end
+		end
+	end
+end
+
+local function facetarget(data: NPCData, targetPosition: Vector3)
+	local bodyGyro = data.bodyGyro
+	if not bodyGyro or bodyGyro.Parent ~= data.root then
+		bodyGyro = data.root:FindFirstChildOfClass("BodyGyro")
+		if not bodyGyro then
+			bodyGyro = Instance.new("BodyGyro")
+			bodyGyro.Name = "NPCAimGyro"
+			bodyGyro.Parent = data.root
+		end
+		data.bodyGyro = bodyGyro
+	end
+
+	local rootPos = data.root.Position
+	local flatTarget = Vector3.new(targetPosition.X, rootPos.Y, targetPosition.Z)
+	local look = flatTarget - rootPos
+	if look.Magnitude <= 0.001 then
+		return
+	end
+
+	bodyGyro.MaxTorque = Vector3.new(0, math.huge, 0)
+	bodyGyro.P = 20000
+	bodyGyro.D = 700
+	bodyGyro.CFrame = CFrame.lookAt(rootPos, flatTarget)
+end
+
+local function setRigForAnimation(data: NPCData, animationName: string)
+	local meta = data.animationMeta[animationName]
+	if not meta then
+		return
+	end
+
+	if meta.isViewmodel then
+		data.npc:SetAttribute("ViewmodelEnabled", true)
+		applyViewmodelMotorState(resolveViewmodelState(data.npc), data.npc)
+	else
+		data.npc:SetAttribute("ViewmodelEnabled", false)
+		applyNormalMotorState(data.npc)
+	end
+end
+local function resolveTrack(cache, path)
+	local node = cache
+	local segments = {}
+
+	for seg in string.gmatch(path, "[^%.]+") do
+		table.insert(segments, seg)
+		if type(node) ~= "table" then break end
+		node = node[seg]
+	end
+
+	if typeof(node) == "Instance" then
+		return node
+	end
+
+	local last = segments[#segments]
+	if not last then return nil end
+
+	local function search(tbl)
+		for k,v in pairs(tbl) do
+			if typeof(v) == "Instance" then
+				if k == last or string.lower(k):find(string.lower(last),1,true) then
+					return v
+				end
+			elseif type(v) == "table" then
+				local f = search(v)
+				if f then return f end
+			end
+		end
+	end
+
+	return search(cache)
+end
+local function playState(data: NPCData, animationName: string, nextState: string?)
+	if data.state == animationName and data.currentTrack and data.currentTrack.IsPlaying then
+		return
+	end
+
+	local track = resolveTrack(data.animationCache, animationName)
+
+	if not track then
+		warn("Missing animation: " .. animationName)
+		return
+	end
+
+	if data.currentTrack and data.currentTrack.IsPlaying then
+		data.currentTrack:Stop(0.15)
+	end
+
+	setRigForAnimation(data, animationName)
+
+	data.state = animationName
+	data.currentTrack = track
+	track:Play(0.15)
+
+	if nextState then
+		local thisTrack = track
+		task.spawn(function()
+			thisTrack.Stopped:Wait()
+			if data.currentTrack == thisTrack then
+				playState(data, nextState)
+			end
+		end)
+	end
+end
+--[[
+playState(data, "Idle")
+playState(data, "Hold_Idle")
+playState(data, "Initiate")
+playState(data, "Unitiate")
+playState(data, "Reload")
+playState(data, "Fire")
+
+playState(data, "Melee.Equip")
+playState(data, "Melee.Idle")
+
+playState(data, "Melee.Down.Initiate")
+playState(data, "Melee.Down.Release")
+now supports shortened ones
+]]
+local function getGunMuzzlePart(data: NPCData): BasePart?
+	local gunValue = data.gun and data.gun.Value
+	if not gunValue then
+		return nil
+	end
+
+	if gunValue:IsA("BasePart") then
+		return gunValue
+	end
+
+	if gunValue:IsA("Model") then
+		if gunValue.PrimaryPart then
+			return gunValue.PrimaryPart
+		end
+
+		local foundPart = gunValue:FindFirstChildWhichIsA("BasePart")
+		if foundPart then
+			return foundPart
+		end
+	end
+
+	return nil
+end
+-- remind me for this to use replicategunshot or whatever its called
+local function fireBullet(data: NPCData, targetPosition: Vector3)
+	local muzzle = getGunMuzzlePart(data)
+	if not muzzle then
+		warn("fireBullet: missing gun PrimaryPart/BasePart on Gun ObjectValue")
+		return
+	end
+
+	local origin = muzzle.Position
+	local bulletEnd = targetPosition
+
+	if data.Inaccuracy then
+		local spread = 2
+		bulletEnd = targetPosition + Vector3.new(
+			(math.random() - 0.5) * spread,
+			(math.random() - 0.5) * spread,
+			(math.random() - 0.5) * spread
+		)
+	end
+
+	packet.ReplicateGunShot.sendToAll({
+		Gun = data.gun.Value.Parent,
+		bulletEnd = bulletEnd,
+		bulletOrigin = data.gun.Value.PrimaryPart.Position,
+		rngSeed = nil
+	})
+	--[[local direction = targetPosition - origin
+	if direction.Magnitude <= 0.001 then
+		direction = muzzle.CFrame.LookVector
+	else
+		direction = direction.Unit
+	end
+
+	local bullet = Instance.new("Part")
+	bullet.Name = "NPCBullet"
+	bullet.Shape = Enum.PartType.Block
+	bullet.Size = Vector3.new(0.3, 0.3, 2.5)
+	bullet.Material = Enum.Material.Neon
+	bullet.Color = Color3.fromRGB(255, 235, 120)
+	bullet.CanCollide = false
+	bullet.CanQuery = false
+	bullet.CanTouch = false
+	bullet.Anchored = true
+	bullet.CFrame = CFrame.new(origin, origin + direction)
+	bullet.Parent = Workspace
+
+	local speed = 280
+	local lifetime = 3
+	local elapsed = 0
+
+	local connection
+	connection = game:GetService("RunService").Heartbeat:Connect(function(dt)
+		elapsed += dt
+		if elapsed >= lifetime then
+			connection:Disconnect()
+			bullet:Destroy()
+			return
+		end
+
+		bullet.CFrame += direction * speed * dt
+	end)]]
+end
+
+
+
+function module.recalibrateHead(npc: Model, lookAtPosition: Vector3, alpha: number?): CFrame
+	local data = REG[npc] or module.Start(npc)
+	local neck = getNeckMotor(data.npc)
+	if not neck or not neck.Part0 or not neck.Part1 then
+		error("recalibrateHead: missing Neck Motor6D")
+	end
+
+	local blend = math.clamp(alpha or 1, 0, 1)
+	local pitch, yaw = computePitchYaw(neck, lookAtPosition)
+	local targetC0 = CFrame.new(neck.C0.Position) * CFrame.Angles(pitch, yaw, 0)
+	neck.C0 = neck.C0:Lerp(targetC0, blend)
+	return neck.C0
+end
+
+function module.Start(npc: Model): NPCData
+	
+	local existing = REG[npc]
+	if existing then
+		return existing
+	end
+
+	local humanoid = npc:FindFirstChildOfClass("Humanoid") :: Humanoid?
+	if not humanoid then
+		error("start: missing Humanoid")
+	end
+
+	local root = npc:FindFirstChild("HumanoidRootPart") :: BasePart?
+	if not root then
+		error("start: missing HumanoidRootPart")
+	end
+
+	local head = npc:FindFirstChild("Head") :: BasePart?
+	if not head then
+		error("start: missing Head")
+	end
+
+	local animator = humanoid:FindFirstChildOfClass("Animator") :: Animator?
+	if not animator then
+		animator = Instance.new("Animator")
+		animator.Parent = humanoid
+	end
+
+	
+	
+	local gun = npc:FindFirstChild("Gun")
+	if not gun then
+		local default =  ServerStorage.ASSETS.Tools.Muskets.Carbine
+		local toolanims = default.Animations
+		local config = require(script.Config)
+		local newObjectValue = Instance.new("ObjectValue")
+		local newgun = default:Clone()
+		newgun.Parent = npc
+		newObjectValue.Name = "Gun"
+		newObjectValue.Value = newgun:FindFirstChildWhichIsA("Model")
+		--firebullet uses the  model parent, i could change this but im lazy
+		newObjectValue.Parent = npc
+		gun = newObjectValue
+		
+
+		-- One of the two motor6Ds for the weapon needs to be enabled and active for this function
+		-- to work properly -28Pixels
+		_toolMethods.ConvertCharacterWeldsToMotor6Ds(newgun, npc) 
+	end
+	local animationCache, animationMeta = loadconfig(npc, animator)
+	local data: NPCData = {
+		npc = npc,
+		humanoid = humanoid,
+		Path = SimplePath.new(npc),
+		root = root,
+		head = head,
+		animator = animator,
+		animationCache = animationCache,
+		animationMeta = animationMeta,
+		currentTrack = nil,
+		state = "Idle",
+		Inaccuracy = false,
+		lastShotTime = 0,
+		target = nil,
+		meleeMode = false,
+		gun = gun :: ObjectValue?,
+		bodyGyro = root:FindFirstChildOfClass("BodyGyro") :: BodyGyro?,
+		timeSeeingTarget = 0,
+		fireQueued = false,
+		team = nil,
+	}
+
+	REG[npc] = data
+	loadstats(data)
+	playState(data, "Idle")
+	module.startController()
+	return data
+end
+
+function module.removeNPC(npc: Model)
+	REG[npc] = nil
+
+	NEAREST_PLAYER_POSITION[npc] = nil
+	print("this guy died lol")
+end
+
+function module.startController()
+	if CONTROL_CONNECTION then
+		return
+	end
+
+	CONTROL_CONNECTION = RunService.Heartbeat:Connect(function(dt)
+		TARGET_REFRESH_ACCUM += dt
+		if TARGET_REFRESH_ACCUM >= TARGET_REFRESH_INTERVAL then
+			TARGET_REFRESH_ACCUM = 0
+			updateNearestPlayerPositions()
+		end
+
+		if not next(REG) then
+			module.stopController()
+			return
+		end
+
+		for npc, data in REG do
+			if data.humanoid.Health <= 0 or data.root.Parent == nil then
+				module.removeNPC(npc)
+				continue
+			end
+
+			local target = data.target
+			local targetHRP = target and target:FindFirstChild("HumanoidRootPart")
+			local distance = targetHRP and (targetHRP.Position - data.root.Position).Magnitude
+
+			if targetHRP and distance and distance <= 20 then
+				if not data.meleeMode then
+					data.meleeMode = true
+					data.fireQueued = false
+					data.timeSeeingTarget = 0
+					playState(data,"Melee.Equip","Melee.Idle")
+				end
+
+				if data.state == "Melee.Idle" then
+					data.Path:Run(targetHRP.Position)
+
+					local attacks = {
+						{"Melee.Down.Initiate","Melee.Down.Release"},
+						{"Melee.Left.Initiate","Melee.Left.Release"},
+						{"Melee.Right.Initiate","Melee.Right.Release"},
+						{"Melee.Up.Initiate","Melee.Up.Release"},
+					}
+
+					local attack = attacks[math.random(#attacks)]
+					playState(data,attack[1],attack[2])
+
+					task.delay(0.45,function()
+						if data.target and data.target:FindFirstChild("HumanoidRootPart") then
+							local dir = (data.root.Position - data.target.HumanoidRootPart.Position).Unit
+							data.Path:Run(data.root.Position + dir * 6)
+						end
+					end)
+				end
+
+				continue
+			end
+
+			if data.meleeMode then
+				data.meleeMode = false
+				playState(data,"Idle")
+			end
+
+			if data.target then
+				local targetHead = data.target:FindFirstChild("Head")
+				local targetPos = if targetHead and targetHead:IsA("BasePart") then targetHead.Position else NEAREST_PLAYER_POSITION[data.npc]
+				if targetPos then
+					facetarget(data,targetPos)
+				end
+			end
+
+			local hasTarget = data.target ~= nil
+			if hasTarget then
+				data.timeSeeingTarget += dt
+			else
+				data.timeSeeingTarget = 0
+				data.fireQueued = false
+			end
+
+			if hasTarget and data.state == "Idle" then
+				data.fireQueued = false
+				data.timeSeeingTarget = 0
+				playState(data,"Initiate","Hold_Idle")
+
+			elseif (not hasTarget) and data.state == "Hold_Idle" then
+				playState(data,"Unitiate","Idle")
+
+			elseif hasTarget and data.state == "Hold_Idle" and data.timeSeeingTarget >= FIRE_AFTER_SECONDS and not data.fireQueued then
+				data.fireQueued = true
+
+				local targetHead = data.target and data.target:FindFirstChild("Head")
+				local targetPos = if targetHead and targetHead:IsA("BasePart") then targetHead.Position else NEAREST_PLAYER_POSITION[data.npc]
+
+				if targetPos then
+					fireBullet(data,targetPos)
+				end
+
+				if data.animationCache["Fire"] then
+					playState(data,"Fire","Reload")
+				elseif data.animationCache["Reload"] then
+					playState(data,"Reload","Idle")
+				else
+					playState(data,"Idle")
+				end
+
+			elseif data.state == "Reload" then
+				data.timeSeeingTarget = 0
+
+			elseif data.state == "Idle" then
+				data.timeSeeingTarget = 0
+				data.fireQueued = false
+			end
+
+			if data.state == "Fire" and (not data.currentTrack or not data.currentTrack.IsPlaying) then
+				if data.animationCache["Reload"] then
+					playState(data,"Reload","Idle")
+				else
+					playState(data,"Idle")
+				end
+			elseif data.state == "Reload" and (not data.currentTrack or not data.currentTrack.IsPlaying) then
+				playState(data,"Idle")
+			end
+		end
+	end)
+end
+
+function module.stopController()
+	if CONTROL_CONNECTION then
+		CONTROL_CONNECTION:Disconnect()
+		CONTROL_CONNECTION = nil
+		print("stopped controller")
+	end
+end
+
+return module
