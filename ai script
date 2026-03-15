@@ -29,13 +29,17 @@ type NPCData = {
 	state: string,
 	Inaccuracy: boolean,
 	meleeMode: boolean,
+	meleeComboActive: boolean,
 	lastShotTime: number,
 	target: Model?,
 	gun: ObjectValue?,
 	bodyGyro: BodyGyro?,
 	timeSeeingTarget: number,
 	fireQueued: boolean,
-	team: string,
+	team: string?,
+	lastFaceUpdate: number,
+	lastMoveUpdate: number,
+	nextMeleeAttackTime: number,
 }
 
 type NPCConfig = {
@@ -46,10 +50,35 @@ type NPCConfig = {
 local REG: {[Model]: NPCData} = {}
 
 local CONTROL_CONNECTION: RBXScriptConnection? = nil
-local TARGET_REFRESH_INTERVAL = 0.2
+local TARGET_REFRESH_INTERVAL = 0.08
 local TARGET_REFRESH_ACCUM = 0
 local NEAREST_PLAYER_POSITION: {[Model]: Vector3} = {}
-local FIRE_AFTER_SECONDS = 2
+local FIRE_AFTER_SECONDS = 0.45
+local MELEE_RANGE = 20
+local MELEE_SWING_DISTANCE = 5
+local MELEE_STEP_BACK_DISTANCE = 10
+local MELEE_TRACK_SPEED = 1.25
+local FACE_UPDATE_INTERVAL = 0.03
+local MOVE_UPDATE_INTERVAL = 0.06
+
+local function getTargetRoot(target: Model?): BasePart?
+	if not target then
+		return nil
+	end
+	local hrp = target:FindFirstChild("HumanoidRootPart")
+	if hrp and hrp:IsA("BasePart") then
+		return hrp
+	end
+	return nil
+end
+
+local function now(): number
+	return os.clock()
+end
+
+local function shouldUpdate(last: number, interval: number): boolean
+	return now() - last >= interval
+end
 
 local function parseAnimationSpec(spec: any): AnimationMeta
 	if type(spec) == "string" then
@@ -160,6 +189,13 @@ local function getNeckMotor(npc: Model): Motor6D?
 
 	return nil
 end
+
+type ViewmodelState = {
+	stateType: string,
+	isViewmodelEnabled: boolean,
+	isHeadDisabled: boolean,
+	isLeftArmDisabled: boolean,
+}
 
 local function resolveViewmodelState(npc: Model): ViewmodelState
 	local data = REG[npc]
@@ -319,12 +355,12 @@ local function getLivePlayerCharacters(): {Model}
 	for _, player in Players:GetPlayers() do
 		local character = player.Character
 		if character then
-		
+
 			local humanoid = character:FindFirstChildOfClass("Humanoid")
 			local hrp = character:FindFirstChild("HumanoidRootPart")
 			if humanoid and humanoid.Health > 0 and hrp and hrp:IsA("BasePart") then
 				table.insert(characters, character)
-				
+
 			end
 		end
 	end
@@ -357,18 +393,19 @@ local function canSeeCharacter(fromData: NPCData, targetCharacter: Model): boole
 
 	return hit.Instance:IsDescendantOf(targetCharacter)
 end
-local function acquireTarget(data: NPCData): Model?
-	
+local function acquireTarget(data: NPCData, characters: {Model}?): Model?
+
 	local closestCharacter: Model? = nil
 	local closestDistance = math.huge
 	local team = data.team
 
-	for _, character in getLivePlayerCharacters() do
+	local characterPool = characters or getLivePlayerCharacters()
+	for _, character in characterPool do
 		local player = Players:GetPlayerFromCharacter(character)
 		if player then
 			local isEnemy = (not player.Team) or player.Team.Name ~= team
 			if isEnemy and canSeeCharacter(data, character) then
-			
+
 				local hrp = character:FindFirstChild("HumanoidRootPart") :: BasePart
 				if hrp then
 					local dist = (hrp.Position - data.root.Position).Magnitude
@@ -384,14 +421,14 @@ local function acquireTarget(data: NPCData): Model?
 	return closestCharacter
 end
 local function updateNearestPlayerPositions()
+	local characters = getLivePlayerCharacters()
 	for npc, data in REG do
 		if data.humanoid.Health > 0 and data.root.Parent ~= nil then
-			local target = acquireTarget(data)
-		
+			local target = acquireTarget(data, characters)
 			data.target = target
 			if target then
-				local hrp = target:FindFirstChild("HumanoidRootPart")
-				if hrp and hrp:IsA("BasePart") then
+				local hrp = getTargetRoot(target)
+				if hrp then
 					NEAREST_PLAYER_POSITION[npc] = hrp.Position
 				end
 			else
@@ -440,6 +477,11 @@ local function setRigForAnimation(data: NPCData, animationName: string)
 		applyNormalMotorState(data.npc)
 	end
 end
+
+local function isMeleeAnimation(animationName: string): boolean
+	return string.sub(animationName, 1, 5) == "Melee"
+end
+
 local function resolveTrack(cache, path)
 	local node = cache
 	local segments = {}
@@ -472,8 +514,9 @@ local function resolveTrack(cache, path)
 
 	return search(cache)
 end
-local function playState(data: NPCData, animationName: string, nextState: string?)
-	if data.state == animationName and data.currentTrack and data.currentTrack.IsPlaying then
+local function playState(data: NPCData, animationName: string, nextState: string?, force: boolean?)
+	local shouldForce = force == true
+	if not shouldForce and data.state == animationName and data.currentTrack and data.currentTrack.IsPlaying then
 		return
 	end
 
@@ -485,20 +528,28 @@ local function playState(data: NPCData, animationName: string, nextState: string
 	end
 
 	if data.currentTrack and data.currentTrack.IsPlaying then
-		data.currentTrack:Stop(0.15)
+		data.currentTrack:Stop(if shouldForce then 0 else 0.15)
 	end
 
 	setRigForAnimation(data, animationName)
 
 	data.state = animationName
 	data.currentTrack = track
-	track:Play(0.15)
+	track:Play(if shouldForce then 0 else 0.15)
+	if isMeleeAnimation(animationName) then
+		track:AdjustSpeed(MELEE_TRACK_SPEED)
+	else
+		track:AdjustSpeed(1)
+	end
 
 	if nextState then
 		local thisTrack = track
 		task.spawn(function()
 			thisTrack.Stopped:Wait()
 			if data.currentTrack == thisTrack then
+				if data.meleeMode and not isMeleeAnimation(nextState) then
+					return
+				end
 				playState(data, nextState)
 			end
 		end)
@@ -519,6 +570,157 @@ playState(data, "Melee.Down.Initiate")
 playState(data, "Melee.Down.Release")
 now supports shortened ones
 ]]
+
+local function startMeleeCombo(data: NPCData)
+	if data.meleeComboActive then
+		return
+	end
+	data.meleeComboActive = true
+	data.nextMeleeAttackTime = now() + 3
+
+	task.spawn(function()
+		while data.meleeMode and data.target and data.humanoid.Health > 0 and data.root.Parent ~= nil do
+			local targetHRP = getTargetRoot(data.target)
+			if not targetHRP then
+				break
+			end
+
+			local toTarget = targetHRP.Position - data.root.Position
+			local distance = toTarget.Magnitude
+			local readyToAttack = now() >= data.nextMeleeAttackTime
+			local desiredHoldDistance = MELEE_SWING_DISTANCE + MELEE_STEP_BACK_DISTANCE
+
+			if distance > 0.001 and shouldUpdate(data.lastFaceUpdate, FACE_UPDATE_INTERVAL) then
+				facetarget(data, targetHRP.Position)
+				data.lastFaceUpdate = now()
+			end
+
+			if not readyToAttack then
+				if shouldUpdate(data.lastMoveUpdate, MOVE_UPDATE_INTERVAL) and distance > 0.001 then
+					if distance < desiredHoldDistance * 0.9 then
+						local away = data.root.Position - targetHRP.Position
+						if away.Magnitude > 0.001 then
+							data.Path:Run(data.root.Position + away.Unit * MELEE_STEP_BACK_DISTANCE)
+							data.lastMoveUpdate = now()
+						end
+					elseif distance > desiredHoldDistance * 1.1 then
+						local holdPoint = targetHRP.Position - toTarget.Unit * desiredHoldDistance
+						data.Path:Run(holdPoint)
+						data.lastMoveUpdate = now()
+					end
+				end
+
+				if data.state ~= "Melee.Idle" then
+					playState(data, "Melee.Idle", nil, true)
+				end
+
+				task.wait(0.03)
+				continue
+			end
+
+			if distance < (MELEE_SWING_DISTANCE * 0.8) then
+				if shouldUpdate(data.lastMoveUpdate, MOVE_UPDATE_INTERVAL) then
+					local away = data.root.Position - targetHRP.Position
+					if away.Magnitude > 0.001 then
+						data.Path:Run(data.root.Position + away.Unit * MELEE_STEP_BACK_DISTANCE)
+						data.lastMoveUpdate = now()
+					end
+				end
+				task.wait(0.08)
+				continue
+			end
+
+			if distance > MELEE_SWING_DISTANCE then
+				local attackStart = now()
+
+				while data.meleeMode and data.target and data.humanoid.Health > 0 and data.root.Parent ~= nil do
+					targetHRP = getTargetRoot(data.target)
+					if not targetHRP then
+						break
+					end
+
+					toTarget = targetHRP.Position - data.root.Position
+					distance = toTarget.Magnitude
+
+					if distance <= MELEE_SWING_DISTANCE then
+						break
+					end
+
+					if shouldUpdate(data.lastFaceUpdate, FACE_UPDATE_INTERVAL) and distance > 0.001 then
+						facetarget(data, targetHRP.Position)
+						data.lastFaceUpdate = now()
+					end
+
+					if shouldUpdate(data.lastMoveUpdate, MOVE_UPDATE_INTERVAL) and distance > 0.001 then
+						local attackPoint = targetHRP.Position - toTarget.Unit * (MELEE_SWING_DISTANCE * 0.9)
+						data.Path:Run(attackPoint)
+						data.lastMoveUpdate = now()
+					end
+
+					if now() - attackStart >= 1.25 then
+						break
+					end
+
+					task.wait(0.03)
+				end
+
+				targetHRP = getTargetRoot(data.target)
+				if not targetHRP then
+					break
+				end
+
+				toTarget = targetHRP.Position - data.root.Position
+				distance = toTarget.Magnitude
+
+				if distance > MELEE_SWING_DISTANCE then
+					data.nextMeleeAttackTime = now() + 0.35
+					task.wait(0.03)
+					continue
+				end
+			end
+
+			local attacks = {
+				{"Melee.Down.Initiate","Melee.Down.Release"},
+				{"Melee.Left.Initiate","Melee.Left.Release"},
+				{"Melee.Right.Initiate","Melee.Right.Release"},
+				{"Melee.Up.Initiate","Melee.Up.Release"},
+			}
+			local attack = attacks[math.random(#attacks)]
+
+			playState(data, attack[1], nil, true)
+			local initiateTrack = data.currentTrack
+			if initiateTrack then
+				initiateTrack.Stopped:Wait()
+			end
+			if not data.meleeMode then
+				break
+			end
+
+			playState(data, attack[2], nil, true)
+			local releaseTrack = data.currentTrack
+			if releaseTrack then
+				releaseTrack.Stopped:Wait()
+			end
+			if not data.meleeMode then
+				break
+			end
+
+			local refreshedTargetHRP = getTargetRoot(data.target)
+			if refreshedTargetHRP and shouldUpdate(data.lastMoveUpdate, MOVE_UPDATE_INTERVAL) then
+				local away = data.root.Position - refreshedTargetHRP.Position
+				if away.Magnitude > 0.001 then
+					data.Path:Run(data.root.Position + away.Unit * MELEE_STEP_BACK_DISTANCE)
+					data.lastMoveUpdate = now()
+				end
+			end
+
+			data.nextMeleeAttackTime = now() + 3
+			playState(data, "Melee.Idle", nil, true)
+			task.wait(0.03)
+		end
+		data.meleeComboActive = false
+	end)
+end
 local function getGunMuzzlePart(data: NPCData): BasePart?
 	local gunValue = data.gun and data.gun.Value
 	if not gunValue then
@@ -550,6 +752,12 @@ local function fireBullet(data: NPCData, targetPosition: Vector3)
 		return
 	end
 
+	local gunValue = data.gun and data.gun.Value
+	if not gunValue then
+		warn("fireBullet: missing Gun ObjectValue.Value")
+		return
+	end
+
 	local origin = muzzle.Position
 	local bulletEnd = targetPosition
 
@@ -562,10 +770,16 @@ local function fireBullet(data: NPCData, targetPosition: Vector3)
 		)
 	end
 
+	local gunContainer = gunValue.Parent
+	if not gunContainer then
+		warn("fireBullet: gun has no parent container")
+		return
+	end
+
 	packet.ReplicateGunShot.sendToAll({
-		Gun = data.gun.Value.Parent,
+		Gun = gunContainer,
 		bulletEnd = bulletEnd,
-		bulletOrigin = data.gun.Value.PrimaryPart.Position,
+		bulletOrigin = origin,
 		rngSeed = nil
 	})
 	--[[local direction = targetPosition - origin
@@ -622,7 +836,7 @@ function module.recalibrateHead(npc: Model, lookAtPosition: Vector3, alpha: numb
 end
 
 function module.Start(npc: Model): NPCData
-	
+
 	local existing = REG[npc]
 	if existing then
 		return existing
@@ -649,8 +863,8 @@ function module.Start(npc: Model): NPCData
 		animator.Parent = humanoid
 	end
 
-	
-	
+
+
 	local gun = npc:FindFirstChild("Gun")
 	if not gun then
 		local default =  ServerStorage.ASSETS.Tools.Muskets.Carbine
@@ -664,7 +878,7 @@ function module.Start(npc: Model): NPCData
 		--firebullet uses the  model parent, i could change this but im lazy
 		newObjectValue.Parent = npc
 		gun = newObjectValue
-		
+
 
 		-- One of the two motor6Ds for the weapon needs to be enabled and active for this function
 		-- to work properly -28Pixels
@@ -686,11 +900,15 @@ function module.Start(npc: Model): NPCData
 		lastShotTime = 0,
 		target = nil,
 		meleeMode = false,
+		meleeComboActive = false,
 		gun = gun :: ObjectValue?,
 		bodyGyro = root:FindFirstChildOfClass("BodyGyro") :: BodyGyro?,
 		timeSeeingTarget = 0,
 		fireQueued = false,
-		team = nil,
+		team = "",
+		lastFaceUpdate = 0,
+		lastMoveUpdate = 0,
+		nextMeleeAttackTime = 0,
 	}
 
 	REG[npc] = data
@@ -731,51 +949,33 @@ function module.startController()
 			end
 
 			local target = data.target
-			local targetHRP = target and target:FindFirstChild("HumanoidRootPart")
+			local targetHRP = getTargetRoot(target)
 			local distance = targetHRP and (targetHRP.Position - data.root.Position).Magnitude
 
-			if targetHRP and distance and distance <= 20 then
+			if targetHRP and distance and distance <= MELEE_RANGE then
 				if not data.meleeMode then
 					data.meleeMode = true
 					data.fireQueued = false
 					data.timeSeeingTarget = 0
-					playState(data,"Melee.Equip","Melee.Idle")
+					playState(data, "Melee.Equip", "Melee.Idle", true)
 				end
 
-				if data.state == "Melee.Idle" then
-					data.Path:Run(targetHRP.Position)
-
-					local attacks = {
-						{"Melee.Down.Initiate","Melee.Down.Release"},
-						{"Melee.Left.Initiate","Melee.Left.Release"},
-						{"Melee.Right.Initiate","Melee.Right.Release"},
-						{"Melee.Up.Initiate","Melee.Up.Release"},
-					}
-
-					local attack = attacks[math.random(#attacks)]
-					playState(data,attack[1],attack[2])
-
-					task.delay(0.45,function()
-						if data.target and data.target:FindFirstChild("HumanoidRootPart") then
-							local dir = (data.root.Position - data.target.HumanoidRootPart.Position).Unit
-							data.Path:Run(data.root.Position + dir * 6)
-						end
-					end)
-				end
-
+				startMeleeCombo(data)
 				continue
 			end
 
 			if data.meleeMode then
 				data.meleeMode = false
-				playState(data,"Idle")
+				data.meleeComboActive = false
+				playState(data, "Idle", nil, true)
 			end
 
-			if data.target then
+			if data.target and shouldUpdate(data.lastFaceUpdate, FACE_UPDATE_INTERVAL) then
 				local targetHead = data.target:FindFirstChild("Head")
 				local targetPos = if targetHead and targetHead:IsA("BasePart") then targetHead.Position else NEAREST_PLAYER_POSITION[data.npc]
 				if targetPos then
-					facetarget(data,targetPos)
+					facetarget(data, targetPos)
+					data.lastFaceUpdate = now()
 				end
 			end
 
@@ -790,11 +990,9 @@ function module.startController()
 			if hasTarget and data.state == "Idle" then
 				data.fireQueued = false
 				data.timeSeeingTarget = 0
-				playState(data,"Initiate","Hold_Idle")
-
+				playState(data, "Initiate", "Hold_Idle")
 			elseif (not hasTarget) and data.state == "Hold_Idle" then
-				playState(data,"Unitiate","Idle")
-
+				playState(data, "Unitiate", "Idle")
 			elseif hasTarget and data.state == "Hold_Idle" and data.timeSeeingTarget >= FIRE_AFTER_SECONDS and not data.fireQueued then
 				data.fireQueued = true
 
@@ -802,20 +1000,18 @@ function module.startController()
 				local targetPos = if targetHead and targetHead:IsA("BasePart") then targetHead.Position else NEAREST_PLAYER_POSITION[data.npc]
 
 				if targetPos then
-					fireBullet(data,targetPos)
+					fireBullet(data, targetPos)
 				end
 
 				if data.animationCache["Fire"] then
-					playState(data,"Fire","Reload")
+					playState(data, "Fire", "Reload")
 				elseif data.animationCache["Reload"] then
-					playState(data,"Reload","Idle")
+					playState(data, "Reload", "Idle")
 				else
-					playState(data,"Idle")
+					playState(data, "Idle")
 				end
-
 			elseif data.state == "Reload" then
 				data.timeSeeingTarget = 0
-
 			elseif data.state == "Idle" then
 				data.timeSeeingTarget = 0
 				data.fireQueued = false
@@ -823,12 +1019,12 @@ function module.startController()
 
 			if data.state == "Fire" and (not data.currentTrack or not data.currentTrack.IsPlaying) then
 				if data.animationCache["Reload"] then
-					playState(data,"Reload","Idle")
+					playState(data, "Reload", "Idle")
 				else
-					playState(data,"Idle")
+					playState(data, "Idle")
 				end
 			elseif data.state == "Reload" and (not data.currentTrack or not data.currentTrack.IsPlaying) then
-				playState(data,"Idle")
+				playState(data, "Idle")
 			end
 		end
 	end)
