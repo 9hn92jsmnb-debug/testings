@@ -2,9 +2,11 @@ local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local ServerStorage = game:GetService("ServerStorage") -- From 28Pixels
+local ServerScriptService = game:GetService("ServerScriptService") -- From 28pixels
 local ReplicatedStorage = game:GetService("ReplicatedStorage") -- From 28Pixels
 
 local _toolMethods = require(ReplicatedStorage.MODULES.ToolModule._toolMethods)  -- From 28Pixels; using it to set up Motor6Ds on newly creatd NPCs
+local ServerProjectileUtility = require(ServerScriptService.MODULES.ServerProjectileUtility) -- From 28pixels; using it to make bullets real
 local SimplePath = require(game.ServerScriptService.MODULES.SimplePath)
 local module = {}
 local packet = require(game.ReplicatedStorage.REFERENCES.PacketReference)
@@ -57,14 +59,14 @@ local TARGET_REFRESH_INTERVAL = 0.08
 local TARGET_REFRESH_ACCUM = 0
 local NEAREST_PLAYER_POSITION: {[Model]: Vector3} = {}
 local FIRE_AFTER_SECONDS = 0.45
-local MELEE_RANGE = 10
+local MELEE_RANGE = 20
 local MELEE_SWING_DISTANCE = 5
 local MELEE_STEP_BACK_DISTANCE = 10
 local MELEE_TRACK_SPEED = 1.25
 local FACE_UPDATE_INTERVAL = 0.03
 local MOVE_UPDATE_INTERVAL = 0.06
-local RELOAD_COVER_DISTANCE = 12
-local RELOAD_COVER_TIMEOUT = 0.8
+local RELOAD_COVER_DISTANCE = 14
+local RELOAD_COVER_TIMEOUT = 1.0
 local RELOAD_COVER_REACHED_DISTANCE = 3
 
 local function getTargetRoot(target: Model?): BasePart?
@@ -491,44 +493,43 @@ local function findReloadCoverPoint(data: NPCData, targetHRP: BasePart): Vector3
 		Vector3.new(-1, 0, -1).Unit,
 	}
 
-	local awayFromTarget = rootPos - targetPos
-	if awayFromTarget.Magnitude > 0.001 then
-		table.insert(candidateDirections, awayFromTarget.Unit)
+	local away = rootPos - targetPos
+	if away.Magnitude > 0.001 then
+		table.insert(candidateDirections, away.Unit)
 	end
 
-	local rayParams = RaycastParams.new()
-	rayParams.FilterType = Enum.RaycastFilterType.Exclude
-	rayParams.FilterDescendantsInstances = ignoreList
-	rayParams.IgnoreWater = true
+	local visibilityParams = RaycastParams.new()
+	visibilityParams.FilterType = Enum.RaycastFilterType.Exclude
+	visibilityParams.FilterDescendantsInstances = ignoreList
+	visibilityParams.IgnoreWater = true
 
-	local downParams = RaycastParams.new()
-	downParams.FilterType = Enum.RaycastFilterType.Exclude
-	downParams.FilterDescendantsInstances = ignoreList
-	downParams.IgnoreWater = true
+	local groundParams = RaycastParams.new()
+	groundParams.FilterType = Enum.RaycastFilterType.Exclude
+	groundParams.FilterDescendantsInstances = ignoreList
+	groundParams.IgnoreWater = true
 
 	local bestPoint: Vector3? = nil
 	local bestScore = -math.huge
 
 	for _, direction in candidateDirections do
 		for _, distance in { RELOAD_COVER_DISTANCE, RELOAD_COVER_DISTANCE + 6, RELOAD_COVER_DISTANCE + 12 } do
-			local flatDir = Vector3.new(direction.X, 0, direction.Z)
-			if flatDir.Magnitude <= 0.001 then
-				continue
-			end
-
-			local candidate = rootPos + flatDir.Unit * distance
-			local groundHit = Workspace:Raycast(candidate + Vector3.new(0, 12, 0), Vector3.new(0, -30, 0), downParams)
+			local candidate = rootPos + Vector3.new(direction.X, 0, direction.Z).Unit * distance
+			local groundHit = Workspace:Raycast(candidate + Vector3.new(0, 12, 0), Vector3.new(0, -35, 0), groundParams)
 			if groundHit then
 				candidate = Vector3.new(candidate.X, groundHit.Position.Y + 2.5, candidate.Z)
 			end
 
 			local toCandidate = candidate - targetPos
-			local sightHit = Workspace:Raycast(targetPos + Vector3.new(0, 2, 0), toCandidate, rayParams)
-			local hasOcclusion = sightHit ~= nil and (sightHit.Position - candidate).Magnitude > 1.5
-			if hasOcclusion then
+			if toCandidate.Magnitude <= 0.001 then
+				continue
+			end
+
+			local visibilityHit = Workspace:Raycast(targetPos + Vector3.new(0, 2, 0), toCandidate, visibilityParams)
+			local occluded = visibilityHit ~= nil and (visibilityHit.Position - candidate).Magnitude > 1.5
+			if occluded then
 				local fartherFromTarget = (candidate - targetPos).Magnitude - (rootPos - targetPos).Magnitude
-				local closerForNPC = -(candidate - rootPos).Magnitude
-				local score = fartherFromTarget * 2 + closerForNPC
+				local pathCost = (candidate - rootPos).Magnitude
+				local score = fartherFromTarget * 2 - pathCost
 				if score > bestScore then
 					bestScore = score
 					bestPoint = candidate
@@ -540,6 +541,28 @@ local function findReloadCoverPoint(data: NPCData, targetHRP: BasePart): Vector3
 	return bestPoint
 end
 
+local function isNPCFullyHiddenFromTarget(data: NPCData, targetHRP: BasePart): boolean
+	local targetCharacter = targetHRP.Parent
+	local visibilityParams = RaycastParams.new()
+	visibilityParams.FilterType = Enum.RaycastFilterType.Exclude
+	visibilityParams.FilterDescendantsInstances = { targetCharacter }
+	visibilityParams.IgnoreWater = true
+
+	for _, descendant in data.npc:GetDescendants() do
+		if descendant:IsA("BasePart") and descendant.Transparency < 1 then
+			local toPart = descendant.Position - targetHRP.Position
+			if toPart.Magnitude > 0.001 then
+				local hit = Workspace:Raycast(targetHRP.Position + Vector3.new(0, 2, 0), toPart, visibilityParams)
+				if hit and hit.Instance and hit.Instance:IsDescendantOf(data.npc) then
+					return false
+				end
+			end
+		end
+	end
+
+	return true
+end
+
 local function runToReloadCover(data: NPCData, targetHRP: BasePart?): boolean
 	if not targetHRP then
 		return false
@@ -547,11 +570,7 @@ local function runToReloadCover(data: NPCData, targetHRP: BasePart?): boolean
 
 	local coverPoint = findReloadCoverPoint(data, targetHRP)
 	if not coverPoint then
-		local away = data.root.Position - targetHRP.Position
-		if away.Magnitude <= 0.001 then
-			return false
-		end
-		coverPoint = data.root.Position + away.Unit * (RELOAD_COVER_DISTANCE + 6)
+		return false
 	end
 
 	data.reloadCoverPoint = coverPoint
@@ -569,12 +588,44 @@ local function isAimingOrReloadState(state: string): boolean
 end
 
 local function setRigForAnimation(data: NPCData, animationName: string)
-	local meta = data.animationMeta[animationName]
-	if not meta then
-		return
+	local function getNestedValue(root, path)
+		local current = root
+
+		for segment in string.gmatch(path, "[^%.]+") do
+			if type(current) ~= "table" then
+				return nil
+			end
+
+			current = current[segment]
+		end
+
+		return current
 	end
 
-	if meta.isViewmodel then
+	local function findByName(root, target)
+		if type(root) ~= "table" then
+			return nil
+		end
+
+		if root[target] ~= nil then
+			return root[target]
+		end
+
+		for _, value in pairs(root) do
+			if type(value) == "table" then
+				local found = findByName(value, target)
+				if found ~= nil then
+					return found
+				end
+			end
+		end
+
+		return nil
+	end
+
+	local meta = getNestedValue(data.animationMeta, animationName) or findByName(data.animationMeta, animationName)
+
+	if meta and meta.isViewmodel then
 		data.npc:SetAttribute("ViewmodelEnabled", true)
 		applyViewmodelMotorState(resolveViewmodelState(data.npc), data.npc)
 	else
@@ -582,7 +633,6 @@ local function setRigForAnimation(data: NPCData, animationName: string)
 		applyNormalMotorState(data.npc)
 	end
 end
-
 local function isMeleeAnimation(animationName: string): boolean
 	return string.sub(animationName, 1, 5) == "Melee"
 end
@@ -625,10 +675,12 @@ local function playState(data: NPCData, animationName: string, nextState: string
 		return
 	end
 
-	local track = resolveTrack(data.animationCache, animationName)
+	local reverseTrack = animationName == "Unitiate"
+	local resolvedAnimationName = reverseTrack and "Initiate" or animationName
+	local track = resolveTrack(data.animationCache, resolvedAnimationName)
 
 	if not track then
-		warn("Missing animation: " .. animationName)
+		warn("Missing animation: " .. resolvedAnimationName)
 		return
 	end
 
@@ -636,15 +688,22 @@ local function playState(data: NPCData, animationName: string, nextState: string
 		data.currentTrack:Stop(if shouldForce then 0 else 0.15)
 	end
 
-	setRigForAnimation(data, animationName)
+	setRigForAnimation(data, resolvedAnimationName)
 
 	data.state = animationName
 	data.currentTrack = track
-	track:Play(if shouldForce then 0 else 0.15)
-	if isMeleeAnimation(animationName) then
-		track:AdjustSpeed(MELEE_TRACK_SPEED)
+
+	if reverseTrack then
+		track:Play(0)
+		track.TimePosition = track.Length - 0.01
+		track:AdjustSpeed(-1)
 	else
-		track:AdjustSpeed(1)
+		track:Play(if shouldForce then 0 else 0.15)
+		if isMeleeAnimation(animationName) then
+			track:AdjustSpeed(MELEE_TRACK_SPEED)
+		else
+			track:AdjustSpeed(1)
+		end
 	end
 
 	if nextState then
@@ -682,7 +741,7 @@ local function startMeleeCombo(data: NPCData)
 	end
 	data.meleeComboActive = true
 	data.nextMeleeAttackTime = now() + 3
-	applyNormalMotorState(data.npc)
+	--applyViewmodelMotorState(data.npc)
 	task.spawn(function()
 		while data.meleeMode and data.target and data.humanoid.Health > 0 and data.root.Parent ~= nil do
 			local targetHRP = getTargetRoot(data.target)
@@ -715,8 +774,8 @@ local function startMeleeCombo(data: NPCData)
 					end
 				end
 
-				if data.state ~= "Melee.Idle" then
-					playState(data, "Melee.Idle", nil, true)
+				if data.state ~= "Melee.MeleeIdle" then
+					playState(data, "Melee.MeleeIdle", nil, true)
 				end
 
 				task.wait(0.03)
@@ -786,8 +845,6 @@ local function startMeleeCombo(data: NPCData)
 
 			local attacks = {
 				{"Melee.Down.Initiate","Melee.Down.Release"},
-				{"Melee.Left.Initiate","Melee.Left.Release"},
-				{"Melee.Right.Initiate","Melee.Right.Release"},
 				{"Melee.Up.Initiate","Melee.Up.Release"},
 			}
 			local attack = attacks[math.random(#attacks)]
@@ -880,13 +937,20 @@ local function fireBullet(data: NPCData, targetPosition: Vector3)
 		warn("fireBullet: gun has no parent container")
 		return
 	end
-
-	packet.ReplicateGunShot.sendToAll({
+		
+	ServerProjectileUtility:ReplicateGunShot({
 		Gun = gunContainer,
 		bulletEnd = bulletEnd,
 		bulletOrigin = origin,
 		rngSeed = nil
-	})
+	}, nil, true, data.npc)
+
+	--packet.ReplicateGunShot.sendToAll({
+	--	Gun = gunContainer,
+	--	bulletEnd = bulletEnd,
+	--	bulletOrigin = origin,
+	--	rngSeed = nil
+	--})
 	--[[local direction = targetPosition - origin
 	if direction.Magnitude <= 0.001 then
 		direction = muzzle.CFrame.LookVector
@@ -972,7 +1036,7 @@ function module.Start(npc: Model): NPCData
 
 	local gun = npc:FindFirstChild("Gun")
 	if not gun then
-		local default =  ServerStorage.ASSETS.Tools.Muskets.Carbine
+		local default =  ServerStorage.ASSETS.Tools.Muskets.Musket
 		local toolanims = default.Animations
 		local config = require(script.Config)
 		local newObjectValue = Instance.new("ObjectValue")
@@ -1021,6 +1085,8 @@ function module.Start(npc: Model): NPCData
 
 	REG[npc] = data
 	loadstats(data)
+	data.npc:SetAttribute("ViewmodelEnabled", false)
+	applyNormalMotorState(data.npc)
 	playState(data, "Idle")
 	module.startController()
 	return data
@@ -1074,6 +1140,7 @@ function module.startController()
 
 			if data.meleeMode then
 				data.meleeMode = false
+				--applyNormalMotorState(data.npc)
 				data.meleeComboActive = false
 				playState(data, "Idle", nil, true)
 			end
@@ -1139,15 +1206,26 @@ function module.startController()
 				end
 			elseif data.state == "Reload" then
 				data.timeSeeingTarget = 0
+				if targetHRP and not isNPCFullyHiddenFromTarget(data, targetHRP) then
+					runToReloadCover(data, targetHRP)
+				end
 			elseif data.state == "Idle" then
 				data.timeSeeingTarget = 0
 				data.fireQueued = false
 			end
 
+			if data.reloadPending and (not data.reloadCoverPoint) then
+				if not runToReloadCover(data, targetHRP) then
+					data.reloadPending = false
+					if data.animationCache["Reload"] and data.state ~= "Reload" then
+						playState(data, "Reload", "Idle")
+					end
+				end
+			end
+
 			if data.reloadPending and data.reloadCoverPoint then
-				local reachedCover = (data.root.Position - data.reloadCoverPoint).Magnitude <= RELOAD_COVER_REACHED_DISTANCE
-				local timedOut = now() >= data.reloadCoverUntil
-				if reachedCover or timedOut then
+				local fullyHidden = targetHRP and isNPCFullyHiddenFromTarget(data, targetHRP)
+				if fullyHidden then
 					data.reloadPending = false
 					data.reloadCoverPoint = nil
 					stopPath(data)
@@ -1156,9 +1234,16 @@ function module.startController()
 					else
 						playState(data, "Idle")
 					end
-				elseif shouldUpdate(data.lastMoveUpdate, MOVE_UPDATE_INTERVAL) and data.Path and data.Path.Run then
-					data.Path:Run(data.reloadCoverPoint)
-					data.lastMoveUpdate = now()
+				else
+					local reachedCover = (data.root.Position - data.reloadCoverPoint).Magnitude <= RELOAD_COVER_REACHED_DISTANCE
+					local timedOut = now() >= data.reloadCoverUntil
+					if reachedCover or timedOut then
+						runToReloadCover(data, targetHRP)
+					end
+					if data.reloadPending and data.reloadCoverPoint and shouldUpdate(data.lastMoveUpdate, MOVE_UPDATE_INTERVAL) and data.Path and data.Path.Run then
+						data.Path:Run(data.reloadCoverPoint)
+						data.lastMoveUpdate = now()
+					end
 				end
 			elseif hasTarget and isAimingOrReloadState(data.state) then
 				stopPath(data)
