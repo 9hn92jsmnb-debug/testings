@@ -59,7 +59,7 @@ local TARGET_REFRESH_INTERVAL = 0.08
 local TARGET_REFRESH_ACCUM = 0
 local NEAREST_PLAYER_POSITION: {[Model]: Vector3} = {}
 local FIRE_AFTER_SECONDS = 0.45
-local MELEE_RANGE = 10
+local MELEE_RANGE = 20
 local MELEE_SWING_DISTANCE = 5
 local MELEE_STEP_BACK_DISTANCE = 10
 local MELEE_TRACK_SPEED = 1.25
@@ -595,7 +595,42 @@ local function isAimingOrReloadState(state: string): boolean
 end
 
 local function setRigForAnimation(data: NPCData, animationName: string)
-	local meta = data.animationMeta[animationName]
+	local function getNestedValue(root, path)
+		local current = root
+
+		for segment in string.gmatch(path, "[^%.]+") do
+			if type(current) ~= "table" then
+				return nil
+			end
+
+			current = current[segment]
+		end
+
+		return current
+	end
+
+	local function findByName(root, target)
+		if type(root) ~= "table" then
+			return nil
+		end
+
+		if root[target] ~= nil then
+			return root[target]
+		end
+
+		for _, value in pairs(root) do
+			if type(value) == "table" then
+				local found = findByName(value, target)
+				if found ~= nil then
+					return found
+				end
+			end
+		end
+
+		return nil
+	end
+
+	local meta = getNestedValue(data.animationMeta, animationName) or findByName(data.animationMeta, animationName)
 
 	if meta and meta.isViewmodel then
 		data.npc:SetAttribute("ViewmodelEnabled", true)
