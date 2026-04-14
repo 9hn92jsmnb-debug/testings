@@ -59,7 +59,7 @@ local TARGET_REFRESH_INTERVAL = 0.08
 local TARGET_REFRESH_ACCUM = 0
 local NEAREST_PLAYER_POSITION: {[Model]: Vector3} = {}
 local FIRE_AFTER_SECONDS = 0.45
-local MELEE_RANGE = 20
+local MELEE_RANGE = 10
 local MELEE_SWING_DISTANCE = 5
 local MELEE_STEP_BACK_DISTANCE = 10
 local MELEE_TRACK_SPEED = 1.25
@@ -579,6 +579,13 @@ local function runToReloadCover(data: NPCData, targetHRP: BasePart?): boolean
 	return true
 end
 
+
+local function resetReloadPending(data: NPCData)
+	data.reloadPending = false
+	data.reloadCoverPoint = nil
+	data.reloadCoverUntil = 0
+end
+
 local function isAimingOrReloadState(state: string): boolean
 	return state == "Hold_Idle"
 		or state == "Initiate"
@@ -588,42 +595,7 @@ local function isAimingOrReloadState(state: string): boolean
 end
 
 local function setRigForAnimation(data: NPCData, animationName: string)
-	local function getNestedValue(root, path)
-		local current = root
-
-		for segment in string.gmatch(path, "[^%.]+") do
-			if type(current) ~= "table" then
-				return nil
-			end
-
-			current = current[segment]
-		end
-
-		return current
-	end
-
-	local function findByName(root, target)
-		if type(root) ~= "table" then
-			return nil
-		end
-
-		if root[target] ~= nil then
-			return root[target]
-		end
-
-		for _, value in pairs(root) do
-			if type(value) == "table" then
-				local found = findByName(value, target)
-				if found ~= nil then
-					return found
-				end
-			end
-		end
-
-		return nil
-	end
-
-	local meta = getNestedValue(data.animationMeta, animationName) or findByName(data.animationMeta, animationName)
+	local meta = data.animationMeta[animationName]
 
 	if meta and meta.isViewmodel then
 		data.npc:SetAttribute("ViewmodelEnabled", true)
@@ -633,6 +605,7 @@ local function setRigForAnimation(data: NPCData, animationName: string)
 		applyNormalMotorState(data.npc)
 	end
 end
+
 local function isMeleeAnimation(animationName: string): boolean
 	return string.sub(animationName, 1, 5) == "Melee"
 end
@@ -675,12 +648,10 @@ local function playState(data: NPCData, animationName: string, nextState: string
 		return
 	end
 
-	local reverseTrack = animationName == "Unitiate"
-	local resolvedAnimationName = reverseTrack and "Initiate" or animationName
-	local track = resolveTrack(data.animationCache, resolvedAnimationName)
+	local track = resolveTrack(data.animationCache, animationName)
 
 	if not track then
-		warn("Missing animation: " .. resolvedAnimationName)
+		warn("Missing animation: " .. animationName)
 		return
 	end
 
@@ -688,22 +659,15 @@ local function playState(data: NPCData, animationName: string, nextState: string
 		data.currentTrack:Stop(if shouldForce then 0 else 0.15)
 	end
 
-	setRigForAnimation(data, resolvedAnimationName)
+	setRigForAnimation(data, animationName)
 
 	data.state = animationName
 	data.currentTrack = track
-
-	if reverseTrack then
-		track:Play(0)
-		track.TimePosition = track.Length - 0.01
-		track:AdjustSpeed(-1)
+	track:Play(if shouldForce then 0 else 0.15)
+	if isMeleeAnimation(animationName) then
+		track:AdjustSpeed(MELEE_TRACK_SPEED)
 	else
-		track:Play(if shouldForce then 0 else 0.15)
-		if isMeleeAnimation(animationName) then
-			track:AdjustSpeed(MELEE_TRACK_SPEED)
-		else
-			track:AdjustSpeed(1)
-		end
+		track:AdjustSpeed(1)
 	end
 
 	if nextState then
@@ -711,6 +675,10 @@ local function playState(data: NPCData, animationName: string, nextState: string
 		task.spawn(function()
 			thisTrack.Stopped:Wait()
 			if data.currentTrack == thisTrack then
+				if animationName == "Reload" then
+					data.reloadPending = false
+					data.reloadCoverPoint = nil
+				end
 				if data.meleeMode and not isMeleeAnimation(nextState) then
 					return
 				end
@@ -741,7 +709,7 @@ local function startMeleeCombo(data: NPCData)
 	end
 	data.meleeComboActive = true
 	data.nextMeleeAttackTime = now() + 3
-	--applyViewmodelMotorState(data.npc)
+
 	task.spawn(function()
 		while data.meleeMode and data.target and data.humanoid.Health > 0 and data.root.Parent ~= nil do
 			local targetHRP = getTargetRoot(data.target)
@@ -845,6 +813,8 @@ local function startMeleeCombo(data: NPCData)
 
 			local attacks = {
 				{"Melee.Down.Initiate","Melee.Down.Release"},
+				{"Melee.Left.Initiate","Melee.Left.Release"},
+				{"Melee.Right.Initiate","Melee.Right.Release"},
 				{"Melee.Up.Initiate","Melee.Up.Release"},
 			}
 			local attack = attacks[math.random(#attacks)]
@@ -937,7 +907,7 @@ local function fireBullet(data: NPCData, targetPosition: Vector3)
 		warn("fireBullet: gun has no parent container")
 		return
 	end
-		
+
 	ServerProjectileUtility:ReplicateGunShot({
 		Gun = gunContainer,
 		bulletEnd = bulletEnd,
@@ -1140,7 +1110,6 @@ function module.startController()
 
 			if data.meleeMode then
 				data.meleeMode = false
-				--applyNormalMotorState(data.npc)
 				data.meleeComboActive = false
 				playState(data, "Idle", nil, true)
 			end
@@ -1161,11 +1130,8 @@ function module.startController()
 			else
 				data.timeSeeingTarget = 0
 				data.fireQueued = false
-				if not hasTarget then
-					data.reloadPending = false
-					data.reloadCoverPoint = nil
-				end
 			end
+
 
 			if data.reloadPending then
 				data.timeSeeingTarget = 0
@@ -1216,7 +1182,7 @@ function module.startController()
 
 			if data.reloadPending and (not data.reloadCoverPoint) then
 				if not runToReloadCover(data, targetHRP) then
-					data.reloadPending = false
+					resetReloadPending(data)
 					if data.animationCache["Reload"] and data.state ~= "Reload" then
 						playState(data, "Reload", "Idle")
 					end
@@ -1226,8 +1192,7 @@ function module.startController()
 			if data.reloadPending and data.reloadCoverPoint then
 				local fullyHidden = targetHRP and isNPCFullyHiddenFromTarget(data, targetHRP)
 				if fullyHidden then
-					data.reloadPending = false
-					data.reloadCoverPoint = nil
+					resetReloadPending(data)
 					stopPath(data)
 					if data.animationCache["Reload"] then
 						playState(data, "Reload", "Idle")
@@ -1263,8 +1228,7 @@ function module.startController()
 					playState(data, "Idle")
 				end
 			elseif data.state == "Reload" and (not data.currentTrack or not data.currentTrack.IsPlaying) then
-				data.reloadPending = false
-				data.reloadCoverPoint = nil
+				resetReloadPending(data)
 				playState(data, "Idle")
 			end
 		end
