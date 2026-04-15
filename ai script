@@ -677,16 +677,19 @@ local function resolveTrack(cache, path)
 
 	return search(cache)
 end
+
 local function playState(data: NPCData, animationName: string, nextState: string?, force: boolean?)
 	local shouldForce = force == true
 	if not shouldForce and data.state == animationName and data.currentTrack and data.currentTrack.IsPlaying then
 		return
 	end
 
-	local track = resolveTrack(data.animationCache, animationName)
+	local reverseTrack = animationName == "Unitiate"
+	local resolvedAnimationName = reverseTrack and "Initiate" or animationName
+	local track = resolveTrack(data.animationCache, resolvedAnimationName)
 
 	if not track then
-		warn("Missing animation: " .. animationName)
+		warn("Missing animation: " .. resolvedAnimationName)
 		return
 	end
 
@@ -694,15 +697,22 @@ local function playState(data: NPCData, animationName: string, nextState: string
 		data.currentTrack:Stop(if shouldForce then 0 else 0.15)
 	end
 
-	setRigForAnimation(data, animationName)
+	setRigForAnimation(data, resolvedAnimationName)
 
 	data.state = animationName
 	data.currentTrack = track
-	track:Play(if shouldForce then 0 else 0.15)
-	if isMeleeAnimation(animationName) then
-		track:AdjustSpeed(MELEE_TRACK_SPEED)
+
+	if reverseTrack then
+		track:Play(0)
+		track.TimePosition = track.Length - 0.01
+		track:AdjustSpeed(-1)
 	else
-		track:AdjustSpeed(1)
+		track:Play(if shouldForce then 0 else 0.15)
+		if isMeleeAnimation(animationName) then
+			track:AdjustSpeed(MELEE_TRACK_SPEED)
+		else
+			track:AdjustSpeed(1)
+		end
 	end
 
 	if nextState then
@@ -848,8 +858,7 @@ local function startMeleeCombo(data: NPCData)
 
 			local attacks = {
 				{"Melee.Down.Initiate","Melee.Down.Release"},
-				{"Melee.Left.Initiate","Melee.Left.Release"},
-				{"Melee.Right.Initiate","Melee.Right.Release"},
+			
 				{"Melee.Up.Initiate","Melee.Up.Release"},
 			}
 			local attack = attacks[math.random(#attacks)]
@@ -1145,6 +1154,7 @@ function module.startController()
 
 			if data.meleeMode then
 				data.meleeMode = false
+				--applyNormalMotorState(data.npc)
 				data.meleeComboActive = false
 				playState(data, "Idle", nil, true)
 			end
@@ -1165,8 +1175,11 @@ function module.startController()
 			else
 				data.timeSeeingTarget = 0
 				data.fireQueued = false
+				if not hasTarget then
+					data.reloadPending = false
+					data.reloadCoverPoint = nil
+				end
 			end
-
 
 			if data.reloadPending then
 				data.timeSeeingTarget = 0
@@ -1217,7 +1230,7 @@ function module.startController()
 
 			if data.reloadPending and (not data.reloadCoverPoint) then
 				if not runToReloadCover(data, targetHRP) then
-					resetReloadPending(data)
+					data.reloadPending = false
 					if data.animationCache["Reload"] and data.state ~= "Reload" then
 						playState(data, "Reload", "Idle")
 					end
@@ -1227,7 +1240,8 @@ function module.startController()
 			if data.reloadPending and data.reloadCoverPoint then
 				local fullyHidden = targetHRP and isNPCFullyHiddenFromTarget(data, targetHRP)
 				if fullyHidden then
-					resetReloadPending(data)
+					data.reloadPending = false
+					data.reloadCoverPoint = nil
 					stopPath(data)
 					if data.animationCache["Reload"] then
 						playState(data, "Reload", "Idle")
@@ -1263,7 +1277,8 @@ function module.startController()
 					playState(data, "Idle")
 				end
 			elseif data.state == "Reload" and (not data.currentTrack or not data.currentTrack.IsPlaying) then
-				resetReloadPending(data)
+				data.reloadPending = false
+				data.reloadCoverPoint = nil
 				playState(data, "Idle")
 			end
 		end
